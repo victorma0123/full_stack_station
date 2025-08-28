@@ -535,20 +535,33 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
     yield {"type": "start"}
 
     prompt = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    
+    # 1️⃣ 默认从 context 取
     station = (context or {}).get("station") if isinstance(context, dict) else None
+
+    # 2️⃣ 如果 context 里没有，或者可能是旧的，就尝试从对话历史里找“已选中基站”
+    #    注意：这里会覆盖掉 context.station，确保拿到最新的一次
+    for m in reversed(messages):
+        if m.get("role") == "assistant" and "已选中基站" in m.get("content", ""):
+            # 从 "已选中基站【xxx】（BJS-006）" 里提取 ID
+            m2 = re.search(r"（([A-Z]{2,5}-\d{3,6})）", m["content"])
+            if m2:
+                sid = m2.group(1)
+                s = db_json.get_station(sid)
+                if s:
+                    station = s
+                    yield {"type": "log", "channel": "router", "message": f"对话历史确认最新选中：{s.get('name')}（{sid}）"}
+            break
+
+    # 3️⃣ 如果还是没有，就走解析逻辑
     if not station:
-        # 先 ID，再名字/TopK
         s2 = resolve_station_from_prompt(prompt or "")
         if s2:
             station = s2
             yield {"type":"log","channel":"router","message":f"由内容解析到站点：{station.get('name','')}（{station.get('id','')}）"}
+
     # 然后走 try_direct_answer（问“它的id/坐标/状态/详情”等都会直答，不进模型）
-    direct = try_direct_answer(prompt, station)
-    if direct:
-        for line in (direct.splitlines(True) or [direct]):
-            yield {"type":"token","delta":line}
-        yield {"type":"end"}; return
-    # （其余城市清单/计数直答、TopK+模型保持不变）
+
     
     cs = extract_city_status_count(prompt)
     if cs:
@@ -579,7 +592,15 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
         yield {"type": "end"}
         return
 
+    direct = try_direct_answer(prompt, station)
+    if direct:
+        for line in (direct.splitlines(True) or [direct]):
+            yield {"type":"token","delta":line}
+        yield {"type":"end"}; return
+    # （其余城市清单/计数直答、TopK+模型保持不变）
 
+
+    
     # ★ 2) 上下文护栏
     station_ctx = ""
     if station:
