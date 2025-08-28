@@ -15,6 +15,9 @@ import { motion } from "framer-motion";
 import { useMap } from "react-leaflet";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
+
+
 const API_BASE = "";
 // 可选：地图库（Leaflet）。如果在你环境中不可用，可把 MapPane 替换成自定义的占位卡片。
 // 预设假数据：北京基站（示例坐标非真实，仅用于 UI 演示）。
@@ -61,6 +64,8 @@ function useEventBus() {
  */
 function ChatBubble({ role, content, meta }) {
   const isUser = role === "user";
+  const isRouter = meta?.channel === "router";
+
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <motion.div
@@ -70,9 +75,77 @@ function ChatBubble({ role, content, meta }) {
           isUser ? "bg-primary text-primary-foreground" : "bg-muted"
         }`}
       >
-        {/* ✅ 外层自己加 div，里面放 markdown */}
-        <div className="prose prose-sm max-w-none">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        <div
+          className={`prose prose-sm max-w-none ${
+            isRouter ? "prose-router" : ""
+          }`}
+        >
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            rehypePlugins={[rehypeRaw]}
+            components={{
+              table: ({ node, ...props }) => (
+                <table
+                  className="table-fixed w-full border border-border text-sm my-3"
+                  {...props}
+                />
+              ),
+              thead: ({ node, ...props }) => (
+                <thead className="bg-muted/60" {...props} />
+              ),
+              th: ({ node, ...props }) => (
+                <th
+                  className="border border-border px-6 py-2 text-left font-medium"
+                  {...props}
+                />
+              ),
+              td: ({ node, ...props }) => (
+                <td
+                  className="border border-border px-6 py-2 align-top"
+                  {...props}
+                />
+              ),
+              code: ({ inline, className, children, ...props }) =>
+                inline ? (
+                  <code
+                    className="font-mono px-1 py-0.5 bg-muted rounded"
+                    {...props}
+                  >
+                    {children}
+                  </code>
+                ) : (
+                  <code
+                    className="block font-mono text-xs p-3 bg-muted rounded overflow-x-auto"
+                    {...props}
+                  >
+                    {children}
+                  </code>
+                ),
+              h1: ({ node, ...props }) => (
+                <h1 className="text-lg font-semibold mt-4 mb-2" {...props} />
+              ),
+              h2: ({ node, ...props }) => (
+                <h2 className="text-base font-semibold mt-3 mb-1.5" {...props} />
+              ),
+              ul: ({ node, ...props }) => (
+                <ul className="list-disc pl-5 space-y-1" {...props} />
+              ),
+              ol: ({ node, ...props }) => (
+                <ol className="list-decimal pl-5 space-y-1" {...props} />
+              ),
+              li: ({ node, ...props }) => (
+                <li className="leading-relaxed" {...props} />
+              ),
+              a: ({ node, ...props }) => (
+                <a
+                  {...props}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 underline"
+                />
+              ),
+            }}
+          >
             {content}
           </ReactMarkdown>
         </div>
@@ -84,6 +157,9 @@ function ChatBubble({ role, content, meta }) {
     </div>
   );
 }
+
+
+
 /**
  * 左侧：聊天面板（手机比例）
  */
@@ -106,7 +182,7 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
 
   const sendToAgent = useCallback(async (text: string, ctx?: any) => {
     if (!text.trim()) return;
-
+  
     const trimmed = text.trim();
     if (/^\/?clear$/i.test(trimmed)) {
       const initial = [
@@ -117,14 +193,14 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
       bus.emit("log:append", { channel: "cmd", message: "会话已清空（不影响记忆）" });
       return;
     }
-
+  
     setMessages((m) => [...m, { role: "user", content: text }]);
     setInput("");
-
+  
     if (/北京/.test(text) && /(基站|5G|站点)/.test(text)) {
       bus.emit("tool:map:load", { query: text, city: "北京" });
     }
-
+  
     const response = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -133,22 +209,22 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
         context: ctx || null,
       }),
     });
-
+  
     if (!response.body) {
       setMessages((m) => [...m, { role: "assistant", content: "后端无响应（没有流）。" }]);
       return;
     }
-
-    // ✅ 预插一个空的助手消息，后续只往这条里拼接 token，避免布局抖动
+  
+    // ✅ 预插一个空的助手消息，后续拼接 token
     let assistantIndex = -1;
     setMessages((m) => {
       assistantIndex = m.length;
-      return [...m, { role: "assistant" as const, content: "" }];
+      return [...m, { role: "assistant" as const, content: "", meta: {} }];
     });
-
+  
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
-
+  
     try {
       let leftover = "";
       while (true) {
@@ -158,14 +234,15 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
         const text = leftover + chunk;
         const lines = text.split("\n");
         leftover = lines.pop() || "";
-
+  
         for (const line of lines) {
           const trimmed = line.trim();
           if (!trimmed.startsWith("data:")) continue;
           const payload = trimmed.slice(5).trim();
           if (!payload) continue;
-
+  
           const ev = JSON.parse(payload);
+  
           if (ev.type === "token") {
             const delta = ev.delta || "";
             setMessages((m) => {
@@ -177,7 +254,20 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
               return copy;
             });
           } else if (ev.type === "log") {
+            // 日志还是正常丢给右侧日志面板
             bus.emit("log:append", { channel: ev.channel || "think", message: ev.message });
+  
+            // ✅ 如果是 router 日志，就给当前助手气泡打上 channel
+            if (ev.channel === "router" && assistantIndex >= 0) {
+              setMessages((m) => {
+                const copy = m.slice();
+                copy[assistantIndex] = {
+                  ...(copy[assistantIndex] as any),
+                  meta: { ...((copy[assistantIndex] as any).meta || {}), channel: "router" },
+                };
+                return copy;
+              });
+            }
           }
         }
       }
@@ -185,7 +275,7 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
       setMessages((m) => [...m, { role: "assistant", content: `流式异常：${e}` }]);
     }
   }, [bus, messages]);
-
+  
   useEffect(() => {
     const off = bus.on("chat:ask-station", ({ station, question }) => {
       fetch("/api/geo/selection", {

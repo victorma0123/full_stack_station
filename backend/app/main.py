@@ -166,14 +166,136 @@ def station_to_markdown(st: dict) -> str:
         osm = f"https://www.openstreetmap.org/?mlat={lat}&mlon={lng}#map=16/{lat}/{lng}"
         lines += ["", f"[在 OpenStreetMap 查看]({osm})"]
     return "\n".join(lines)
+from collections import Counter
+def _md_table(header_cols, rows):
+    head = "| " + " | ".join(header_cols) + " |"
+    sep  = "|" + "|".join(["---"] * len(header_cols)) + "|"
+    body = ["| " + " | ".join(map(str, r)) + " |" for r in rows]
+    return "\n".join([head, sep, *body])
+
+def _breakdown_table(title, counter: Counter, topn: int = 6):
+    items = counter.most_common(topn)
+    md = f"**{title}**\n\n" + _md_table(["项", "数量"], items if items else [["—", 0]])
+    return md
+
+def render_city_overview_report(city: str, rows: list[dict]) -> str:
+    total = len(rows)
+    status_ct = Counter([r.get("status","").lower() for r in rows])
+    vendor_ct = Counter([r.get("vendor","") for r in rows])
+    band_ct   = Counter([r.get("band","") for r in rows])
+
+    # 1) 概览
+    p1 = [
+        f"# 1. 概览",
+        f"- **城市**：{city}",
+        f"- **基站总数**：**{total}**\n",
+        f"- **状态分布**：在线 **{status_ct.get('online',0)}** · 维护 **{status_ct.get('maintenance',0)}** · 离线 **{status_ct.get('offline',0)}**",
+    ]
+
+    # 2) 网络情况分析
+    p2 = [
+        f"# 2. 网络情况分析",
+        "- **重点**：关注**离线**与**维护**站点的成因（电源/回传/射频），以及高负荷小区的扩容计划。\n",
+        _breakdown_table("厂商分布", vendor_ct),
+        "",
+        _breakdown_table("频段分布", band_ct),
+    ]
+
+    # 3) 数据明细（表格）
+    detail_rows = [
+        [r["id"], r["name"], r["vendor"], r["band"], r["status"]]
+        for r in rows[:100]  # 明细最多前 100 条，防止过长
+    ]
+    p3 = [
+        f"# 3. 数据明细",
+        _md_table(["ID", "名称", "厂商", "频段", "状态"], detail_rows if detail_rows else [["—","—","—","—","—"]]),
+    ]
+
+    # 4) 路由/管理检查（示例建议 & 等宽高亮）
+    p4 = [
+        f"# 4. 路由与管理检查（建议）",
+        "- **OSPF** 邻接与收敛时延抽样；**SNMP** 采样完整性；NTP 偏移监控。",
+        "- 样例核查项：",
+        "  - · `router-id 1.1.1.1` 是否统一规范",
+        "  - · `LLDP` 拓扑邻接是否闭环",
+        "  - · 回传口 QOS/ACL 是否与基线一致（如 `tangro` 模板）",
+    ]
+    return "\n\n".join(["\n".join(p1), "\n".join(p2), "\n".join(p3), "\n".join(p4)])
+
+def render_city_status_report(city: str, status: str, rows: list[dict]) -> str:
+    total = len(rows)
+    vendor_ct = Counter([r.get("vendor","") for r in rows])
+    band_ct   = Counter([r.get("band","") for r in rows])
+
+    p1 = [
+        f"# 1. 概览",
+        f"- **城市**：{city}",
+        f"- **状态**：**{status}**",
+        f"- **基站数量**：**{total}**",
+    ]
+
+    p2 = [
+        f"# 2. 网络情况分析",
+        "- **重点**：若为 **offline**，优先排查电源/传输；若为 **maintenance**，关注工单进度与风险窗口；若为 **online**，抽样 KPI。",
+        _breakdown_table("厂商分布", vendor_ct),
+        "",
+        _breakdown_table("频段分布", band_ct),
+    ]
+
+    detail_rows = [
+        [r["id"], r["name"], r["vendor"], r["band"]]
+        for r in rows[:60]
+    ]
+    p3 = [
+        f"# 3. 数据明细",
+        _md_table(["ID", "名称", "厂商", "频段"], detail_rows if detail_rows else [["—","—","—","—"]]),
+    ]
+
+    p4 = [
+        f"# 4. 路由检查（示例）",
+        "- 核查要点：",
+        "  - · **OSPF** 邻接是否稳定，LSA 泛洪是否异常",
+        "  - · **BFD** 是否启用，故障切换是否在目标时延内",
+        "  - · `snmp-server community public RO` 等敏感配置是否符合安全基线",
+    ]
+    return "\n\n".join(["\n".join(p1), "\n".join(p2), "\n".join(p3), "\n".join(p4)])
 
 def city_table_markdown(city: str, rows: list[dict]) -> str:
+    """把某个城市的基站列表转成 Markdown 报告格式"""
+
+    total = len(rows)
     if not rows:
-        return f"未在 **{city}** 找到基站。"
-    head = "| ID | 名称 | 厂商 | 频段 | 状态 |"
-    sep  = "|---|---|---|---|---|"
-    body = [f"| {r['id']} | {r['name']} | {r['vendor']} | {r['band']} | {r['status']} |" for r in rows]
-    return "\n".join([f"**{city} 基站清单（前 {len(rows)} 条）**", "", head, sep, *body])
+        return f"# {city} 基站清单\n\n⚠️ 没有找到相关基站。\n"
+
+    # 概览部分
+    parts = [
+        f"# {city} 基站清单\n",
+        f"**城市**：{city}  \n**基站总数**：**{total}**\n",
+        "---\n",  # 分隔线
+        "## 数据明细\n",
+    ]
+
+    # 表格标题
+    header = ["ID", "名称", "厂商", "频段", "状态"]
+    lines = ["| " + " | ".join(header) + " |"]
+    lines.append("|" + "|".join(["---"] * len(header)) + "|")
+
+    # 内容行
+    for r in rows:
+        line = "| " + " | ".join([
+            str(r.get("id", "—")),
+            str(r.get("name", "—")),
+            str(r.get("vendor", "—")),
+            str(r.get("band", "—")),
+            f"**{r.get('status', '—')}**",   # 状态加粗
+        ]) + " |"
+        lines.append(line)
+
+    parts.append("\n".join(lines))
+    parts.append("\n---\n")  # 结尾分隔线
+
+    return "\n".join(parts)
+
 
 def topk_context_for_prompt(prompt: str, k: int = 12) -> list[dict]:
     """复用 /api/db/stations/search 的简易打分逻辑，供模型兜底拼上下文。"""
@@ -567,16 +689,9 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
     if cs:
         city, status = cs
         rows = db_json.search_stations(city=city, status=status, limit=1000)
-        count = len(rows)
-        msg = f"**{city} {status}** 状态的基站数量：**{count}** 个。"
-        # 可选：顺带列出前 5 条，便于验证
-        if count:
-            head = "| ID | 名称 | 厂商 | 频段 |"
-            sep  = "|---|---|---|---|"
-            body = [f"| {r['id']} | {r['name']} | {r['vendor']} | {r['band']} |" for r in rows[:5]]
-            msg += "\n\n" + "\n".join([head, sep, *body])
-        yield {"type": "log", "channel": "router", "message": f"命中计数直答：{city} / {status} = {count}"}
-        for line in (msg.splitlines(True) or [msg]):
+        report = render_city_status_report(city, status, rows)
+        yield {"type": "log", "channel": "router", "message": f"命中计数直答：{city} / {status} = {len(rows)}（报告体裁）"}
+        for line in (report.splitlines(True) or [report]):
             yield {"type": "token", "delta": line}
         yield {"type": "end"}
         return
@@ -584,13 +699,14 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
     # ★ 1.5) 城市清单直答（例如“北京有哪些基站/北京的基站”）
     city = extract_city(prompt or "")
     if want_list(prompt) and city:
-        rows = db_json.search_stations(city=city, limit=100)
-        md = city_table_markdown(city, rows)
-        yield {"type": "log", "channel": "router", "message": f"命中城市清单直答：{city}（{len(rows)}条）"}
-        for line in (md.splitlines(True) or [md]):
+        rows = db_json.search_stations(city=city, limit=300)
+        report = render_city_overview_report(city, rows)
+        yield {"type": "log", "channel": "router", "message": f"命中城市清单直答：{city}（{len(rows)}条，报告体裁）"}
+        for line in (report.splitlines(True) or [report]):
             yield {"type": "token", "delta": line}
         yield {"type": "end"}
         return
+
 
     direct = try_direct_answer(prompt, station)
     if direct:

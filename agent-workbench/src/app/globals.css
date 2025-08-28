@@ -122,3 +122,44 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Router 专用 Markdown 样式 */
+.prose.prose-router h1 {
+  color: #2563eb; /* blue-600 */
+}
+.prose.prose-router h2 {
+  color: #7c3aed; /* violet-600 */
+}
+.prose.prose-router strong {
+  color: #4338ca; /* indigo-700 */
+}
+.prose.prose-router code {
+  background-color: #ede9fe; /* violet-100 */
+  color: #5b21b6;           /* violet-800 */
+  border-radius: 0.25rem;
+  padding: 0.1rem 0.25rem;
+}
+.prose.prose-router table {
+  border-collapse: collapse;
+}
+.prose.prose-router table th {
+  background-color: #eef2ff; /* indigo-50 */
+}
+.prose.prose-router table th,
+.prose.prose-router table td,
+.prose.prose-router table {
+  border-color: var(--border);
+}
+.prose.prose-router a {
+  color: #2563eb; /* blue-600 */
+  text-decoration: underline;
+}
+
+/* 暗色模式下的微调 */
+.dark .prose.prose-router code {
+  background-color: #312e81; /* indigo-900 */
+  color: #c4b5fd;           /* violet-300 */
+}
+.dark .prose.prose-router table th {
+  background-color: #3730a3; /* indigo-800 */
+}
