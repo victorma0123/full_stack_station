@@ -1,3 +1,4 @@
+
 # app/mock_geo.py
 from __future__ import annotations
 import random
@@ -66,7 +67,7 @@ def seed(seed_value: Optional[int] = None):
 def list_cities() -> List[Dict]:
     return [{"name": c, "code": GEO[c]["code"], "center": GEO[c]["center"]} for c in GEO]
 
-def list_stations(city: str, randomize_status: bool = True) -> List[Dict]:
+def list_stations(city: str, randomize_status: bool = False) -> List[Dict]:
     if city not in GEO:
         return []
     st = GEO[city]["stations"]
