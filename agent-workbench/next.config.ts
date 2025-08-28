@@ -1,5 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  reactStrictMode: false,          // ← 加这行
   async rewrites() {
     return process.env.NODE_ENV === "development"
       ? [
