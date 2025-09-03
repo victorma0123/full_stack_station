@@ -18,7 +18,7 @@ import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 
 
-const API_BASE = "";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 // 可选：地图库（Leaflet）。如果在你环境中不可用，可把 MapPane 替换成自定义的占位卡片。
 // 预设假数据：北京基站（示例坐标非真实，仅用于 UI 演示）。
 const demoStations = [
@@ -82,7 +82,7 @@ function ChatBubble({ role, content, meta }) {
         >
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
-            rehypePlugins={[rehypeRaw]}
+    
             components={{
               table: ({ node, ...props }) => (
                 <table
@@ -167,10 +167,101 @@ function ChatBubble({ role, content, meta }) {
 
 function ChatPane({ width = 420, height = 720, fill = false }: { width?: number; height?: number; fill?: boolean }) {
   const bus = useContext(BusCtx);
+  const [streamActive, setStreamActive] = useState(false);
+  const assistantIndexRef = useRef<number>(-1);
+  const controllerRef = useRef<AbortController | null>(null);
+  // 追踪 think 模式与缓冲
+  const inThinkXmlRef   = useRef<boolean>(false);   // <think> ... </think>
+  const inThinkFenceRef = useRef<boolean>(false);   // ```think / ```thought / ```reasoning
+  const thinkBufRef     = useRef<string>("");       // 累积 think 文本
+
   const [messages, setMessages] = useState([
     { role: "assistant", content: "你好，我是你的现场 Agent。你可以问：‘我想看看北京的基站’。" },
   ]);
   const [input, setInput] = useState("");
+  const stripThinkAndLog = useCallback((raw: string) => {
+    let s = raw;
+  
+    // ===== 1) XML 风格 <think>...</think> =====
+    if (inThinkXmlRef.current) {
+      const end = s.toLowerCase().indexOf("</think>");
+      if (end >= 0) {
+        // 收尾：把 think 内的本片内容入缓冲，然后退出 think
+        thinkBufRef.current += s.slice(0, end);
+        s = s.slice(end + "</think>".length);
+        inThinkXmlRef.current = false;
+  
+        const t = thinkBufRef.current.replace(/\s+/g, " ").trim();
+        if (t) bus.emit("log:append", { channel: "think", message: t.length > 240 ? t.slice(0, 240) + "…" : t });
+        thinkBufRef.current = "";
+      } else {
+        // 整个分片都在 think 内：累计并吞掉
+        thinkBufRef.current += s;
+        return "";
+      }
+    }
+    // 本分片可能出现新的 <think>
+    while (true) {
+      const start = s.toLowerCase().indexOf("<think>");
+      if (start < 0) break;
+      const end = s.toLowerCase().indexOf("</think>", start + 7);
+      if (end >= 0) {
+        // 同片开闭：提取日志并删除
+        const inner = s.slice(start + 7, end);
+        const t = inner.replace(/\s+/g, " ").trim();
+        if (t) bus.emit("log:append", { channel: "think", message: t.length > 240 ? t.slice(0, 240) + "…" : t });
+        s = s.slice(0, start) + s.slice(end + "</think>".length);
+      } else {
+        // 只开未闭：进入 think 状态，截断后续
+        inThinkXmlRef.current = true;
+        thinkBufRef.current += s.slice(start + 7);
+        s = s.slice(0, start);
+        break;
+      }
+    }
+  
+    // ===== 2) 围栏 ```think / ```thought / ```reasoning =====
+    const fenceOpen  = /```(?:think|thought|reasoning)\b/i;
+    const fenceClose = /```/;
+  
+    if (inThinkFenceRef.current) {
+      const mClose = s.match(fenceClose);
+      if (mClose) {
+        thinkBufRef.current += s.slice(0, mClose.index!);
+        s = s.slice(mClose.index! + mClose[0].length);
+        inThinkFenceRef.current = false;
+  
+        const t = thinkBufRef.current.replace(/\s+/g, " ").trim();
+        if (t) bus.emit("log:append", { channel: "think", message: t.length > 240 ? t.slice(0, 240) + "…" : t });
+        thinkBufRef.current = "";
+      } else {
+        thinkBufRef.current += s;
+        return "";
+      }
+    }
+    while (true) {
+      const mOpen = s.match(fenceOpen);
+      if (!mOpen) break;
+      const from = mOpen.index! + mOpen[0].length;
+      const rest = s.slice(from);
+      const mClose = rest.match(fenceClose);
+      if (mClose) {
+        const inner = rest.slice(0, mClose.index!);
+        const t = inner.replace(/\s+/g, " ").trim();
+        if (t) bus.emit("log:append", { channel: "think", message: t.length > 240 ? t.slice(0, 240) + "…" : t });
+        // 删除整段围栏内容
+        s = s.slice(0, mOpen.index!) + rest.slice(mClose.index! + mClose[0].length);
+      } else {
+        inThinkFenceRef.current = true;
+        thinkBufRef.current += rest;
+        s = s.slice(0, mOpen.index!);
+        break;
+      }
+    }
+  
+    return s;
+  }, [bus]);
+  
 
   const endRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -181,10 +272,18 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
   }, [messages]);
 
   const sendToAgent = useCallback(async (text: string, ctx?: any) => {
-    if (!text.trim()) return;
+    const ask = text.trim();
+    if (!ask) return;
   
-    const trimmed = text.trim();
-    if (/^\/?clear$/i.test(trimmed)) {
+    // 并发保护：若正在流式输出，先打断旧流
+    if (streamActive && controllerRef.current) {
+      try { controllerRef.current.abort(); } catch {}
+      controllerRef.current = null;
+      setStreamActive(false);
+    }
+  
+    // /clear
+    if (/^\/?clear$/i.test(ask)) {
       const initial = [
         { role: "assistant", content: "你好，我是你的现场 Agent。你可以问：‘我想看看北京的基站’。" },
       ];
@@ -194,87 +293,127 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
       return;
     }
   
-    setMessages((m) => [...m, { role: "user", content: text }]);
+    // 用户消息入列
+    const userMsg = { role: "user" as const, content: ask };
+    setMessages((m) => [...m, userMsg]);
     setInput("");
   
-    if (/北京/.test(text) && /(基站|5G|站点)/.test(text)) {
-      bus.emit("tool:map:load", { query: text, city: "北京" });
+    // 联动地图（可留）
+    if (/北京/.test(ask) && /(基站|5G|站点)/.test(ask)) {
+      bus.emit("tool:map:load", { query: ask, city: "北京" });
     }
   
-    const response = await fetch("/api/chat/stream", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        messages: [...messages, { role: "user", content: text }],
-        context: ctx || null,
-      }),
-    });
+    // 稳定快照（避免异步 setState 造成丢历史）
+    const convo = [...messages, userMsg];
   
-    if (!response.body) {
-      setMessages((m) => [...m, { role: "assistant", content: "后端无响应（没有流）。" }]);
-      return;
-    }
-  
-    // ✅ 预插一个空的助手消息，后续拼接 token
-    let assistantIndex = -1;
+    // 先插入“空气泡”，并记录索引到 ref
     setMessages((m) => {
-      assistantIndex = m.length;
+      assistantIndexRef.current = m.length;
       return [...m, { role: "assistant" as const, content: "", meta: {} }];
     });
   
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder("utf-8");
+    // 开始流
+    const ac = new AbortController();
+    controllerRef.current = ac;
+    setStreamActive(true);
   
     try {
-      let leftover = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        const text = leftover + chunk;
-        const lines = text.split("\n");
-        leftover = lines.pop() || "";
+      const response = await fetch(`${API_BASE}/api/chat/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+        body: JSON.stringify({ messages: convo, context: ctx || null }),
+        signal: ac.signal,
+        // 这三项能避免浏览器/中间层缓冲
+        cache: "no-store",
+        keepalive: false,
+      });
   
+      if (!response.body) {
+        throw new Error("后端无响应（没有流 body）");
+      }
+  
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+  
+      // —— SSE 解析：按“空行”切事件，忽略心跳行（以冒号起始）
+      let buf = "";
+      const flushEvent = (evt: string) => {
+        // 只处理 data: 行
+        const lines = evt.split("\n").map(l => l.trim()).filter(Boolean);
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-          const payload = trimmed.slice(5).trim();
-          if (!payload) continue;
+          if (line.startsWith(":")) continue; // 心跳
+          if (!line.startsWith("data:")) continue;
+          const jsonStr = line.slice(5).trim();
+          if (!jsonStr) continue;
   
-          const ev = JSON.parse(payload);
+          let ev: any;
+          try { ev = JSON.parse(jsonStr); } catch { continue; }
+  
+          if (ev.type === "start") return;
   
           if (ev.type === "token") {
-            const delta = ev.delta || "";
+            const clean = stripThinkAndLog(ev.delta || "");
+            if (!clean) return; // 这片要么在 think 内，要么被完全剥离
+          
+            const i = assistantIndexRef.current;
             setMessages((m) => {
+              if (i < 0 || i >= m.length) return m;
               const copy = m.slice();
-              copy[assistantIndex] = {
-                ...(copy[assistantIndex] as any),
-                content: (copy[assistantIndex] as any).content + delta,
-              };
+              copy[i] = { ...(copy[i] as any), content: (copy[i] as any).content + clean };
               return copy;
             });
-          } else if (ev.type === "log") {
-            // 日志还是正常丢给右侧日志面板
-            bus.emit("log:append", { channel: ev.channel || "think", message: ev.message });
+            return;
+          }
+          
   
-            // ✅ 如果是 router 日志，就给当前助手气泡打上 channel
-            if (ev.channel === "router" && assistantIndex >= 0) {
+          if (ev.type === "log") {
+            bus.emit("log:append", { channel: ev.channel || "think", message: ev.message });
+            if (ev.channel === "router") {
+              const i = assistantIndexRef.current;
               setMessages((m) => {
+                if (i < 0 || i >= m.length) return m;
                 const copy = m.slice();
-                copy[assistantIndex] = {
-                  ...(copy[assistantIndex] as any),
-                  meta: { ...((copy[assistantIndex] as any).meta || {}), channel: "router" },
+                copy[i] = {
+                  ...(copy[i] as any),
+                  meta: { ...((copy[i] as any).meta || {}), channel: "router" },
                 };
                 return copy;
               });
             }
+            return;
+          }
+  
+          if (ev.type === "end") {
+            // 正常结束
+            throw new DOMException("done", "AbortError"); // 统一跳出 while
           }
         }
+      };
+  
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+  
+        // 事件以空行分割：\n\n
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const evt = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          flushEvent(evt);
+        }
       }
-    } catch (e) {
-      setMessages((m) => [...m, { role: "assistant", content: `流式异常：${e}` }]);
+    } catch (err: any) {
+      // “正常结束”走了 AbortError(done)，不要报错
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        setMessages((m) => [...m, { role: "assistant", content: `流式异常：${String(err?.message || err)}` }]);
+      }
+    } finally {
+      setStreamActive(false);
+      controllerRef.current = null;
+      requestAnimationFrame(() => endRef.current?.scrollIntoView({ block: "end" }));
     }
-  }, [bus, messages]);
+  }, [bus, messages, streamActive]);
   
   useEffect(() => {
     const off = bus.on("chat:ask-station", ({ station, question }) => {
@@ -302,6 +441,13 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
     return () => off && off();
   }, [bus]);
 
+  useEffect(() => {
+    return () => {
+      try { controllerRef.current?.abort(); } catch {}
+    };
+  }, []);
+  
+
   return (
     <Card 
       className="overflow-hidden rounded-3xl h-full" style={{ height: fill ? "100%" : height, width: fill ? "100%" : width, maxWidth: "100%" }}>
@@ -320,15 +466,16 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
             </div>
           </ScrollArea>
           <div className="p-3 border-t flex items-center gap-2 bg-background">
-            <Input
-              placeholder="提问：例如 ‘我想看看北京的基站’"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && sendToAgent(input)}
-            />
-            <Button onClick={() => sendToAgent(input)} className="gap-1">
-              <Send size={16} /> 发送
-            </Button>
+          <Input
+            placeholder="提问：例如 ‘我想看看北京的基站’"
+            value={input}
+            disabled={streamActive}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && !streamActive && sendToAgent(input)}
+          />
+          <Button onClick={() => sendToAgent(input)} className="gap-1" disabled={streamActive}>
+            <Send size={16} /> {streamActive ? "生成中…" : "发送"}
+          </Button>
           </div>
         </div>
       </CardContent>

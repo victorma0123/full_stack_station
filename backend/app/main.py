@@ -12,6 +12,10 @@ from app import db_json
 from pydantic import BaseModel
 from typing import Optional
 import anyio
+from fastapi import Request
+import base64
+import httpx
+import asyncio
 
 #from app import rag_store
 
@@ -27,6 +31,9 @@ model = OllamaModel(
     host="http://127.0.0.1:11434",
     model_id="qwen3:1.7b",   # 改成你本机可用模型
 )
+OLLAMA_HOST = "http://127.0.0.1:11434"
+OLLAMA_MODEL_ID = "qwen3:1.7b"
+
 
 agent = Agent(
     model=model,
@@ -38,6 +45,35 @@ agent = Agent(
 # ===== 放在 main.py 顶部其它函数旁 =====
 import re
 
+async def stream_from_ollama(prompt: str):
+    """
+    直接对接 Ollama /api/generate 的流式接口：
+    一行一个 JSON：{"response": "...", "done": false} ... {"done": true}
+    """
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream(
+            "POST",
+            f"{OLLAMA_HOST}/api/generate",
+            json={
+                "model": OLLAMA_MODEL_ID,
+                "prompt": prompt,
+                "stream": True,
+            },
+            headers={"Accept": "application/json"},
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if "response" in obj:
+                    # 这里返回“增量”
+                    yield obj["response"]
+                if obj.get("done"):
+                    break
 
 # 1) 新增：按“站名/名称/叫/引号”提取名字，并用本地库解析成 station
 NAME_HINT_RE = re.compile(r"(?:站名|名称|名字|名为|叫)\s*([^\s，。,:;!?【】《》]{2,32})")
@@ -557,11 +593,18 @@ def db_stations_search(
 # 允许本地前端直连
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://10.50.13.148:3000",  # ← 你的 Dev 机 IP
+    ],
+    # 或者用正则（FastAPI 也支持）：
+    # allow_origin_regex=r"http://.*:3000",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.get("/health")
 def health():
@@ -630,6 +673,74 @@ def chunk_text(text: str) -> List[str]:
 async def sse(gen: AsyncGenerator[Dict[str, Any], None]):
     async for ev in gen:
         yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+async def heartbeat(interval: float = 10.0):
+    """SSE 心跳：注释行会刷新代理/浏览器缓冲"""
+    while True:
+        yield ": ping\n\n"
+        await anyio.sleep(interval)
+
+@app.get("/api/chat/sse")
+async def chat_sse(payload: str = Query(...)):
+    """
+    EventSource 使用的 GET SSE 入口。
+    前端会把 {messages, context} 打包成 base64 放到 ?payload=
+    """
+    # 1) 解析 payload
+    try:
+        raw = base64.b64decode(payload.encode("utf-8")).decode("utf-8")
+        data = json.loads(raw)
+        messages = data.get("messages") or []
+        ctx = data.get("context") or None
+    except Exception as e:
+        # 出错也要用 SSE 格式回一条错误，再 end
+        async def err_gen():
+            yield f"data: {json.dumps({'type':'token','delta': f'参数解析失败：{e}'}, ensure_ascii=False)}\n\n"
+            yield "data: {\"type\":\"end\"}\n\n"
+        return StreamingResponse(
+            err_gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # 2) 合并“模型输出流”和“心跳流”
+    async def merged():
+        # 先立即发一条 start，前端据此立刻创建空的助手气泡
+        yield "data: {\"type\":\"start\"}\n\n"
+
+        async with anyio.create_task_group() as tg:
+            send_chan, recv_chan = anyio.create_memory_object_stream(32)
+
+            async def _agent():
+                async for ev in agent_stream(messages, context=ctx):
+                    await send_chan.send(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
+                await send_chan.aclose()
+
+            async def _hb():
+                async for beat in heartbeat(10.0):
+                    await send_chan.send(beat)
+
+            tg.start_soon(_agent)
+            tg.start_soon(_hb)
+
+            async with recv_chan:
+                async for chunk in recv_chan:
+                    # 关键：小块直出，不聚合，防止缓冲
+                    yield chunk
+
+    return StreamingResponse(
+        merged(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 若前面有 Nginx 反代
+        },
+    )
+
 
 # 放到文件上方任意位置
 def summarize_or_redact(text: str, limit: int = 240) -> str:
@@ -654,7 +765,7 @@ def extract_safe_think_from_agent(agent) -> str:
     return "（无可展示的思考摘要）"
 
 async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] | None = None):
-    yield {"type": "start"}
+    #yield {"type": "start"}
 
     prompt = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
     
@@ -745,31 +856,23 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
     )
 
 
-    # ★ 3) 模型兜底：仅给 Top-K 精简表做检索增强，避免全量 JSON
+   
+# ★ 3) 模型兜底：仅给 Top-K 精简表做检索增强，避免全量 JSON
     topk = topk_context_for_prompt(prompt, k=12)
     ctx_md = rows_to_compact_md(topk)
     if ctx_md:
         aug_prompt = ("【可用基站候选（仅供参考）】\n" + ctx_md + "\n\n" + aug_prompt)
         yield {"type": "log", "channel": "router", "message": f"提供 TopK={len(topk)} 行上下文给模型"}
 
-    # 放到线程池，避免阻塞 SSE
-    text_raw = await anyio.to_thread.run_sync(agent, aug_prompt)
-    final_text, safe_think = split_think_and_final(str(text_raw))
-    if safe_think:
-        yield {"type": "log", "channel": "think", "message": safe_think}
+    # === 真流式：直连 Ollama ===
+    buf = []
+    async for delta in stream_from_ollama(aug_prompt):
+        buf.append(delta)
+        yield {"type": "token", "delta": delta}
 
-    # ★ 4) 后验校验
-    try:
-        other_ids = re.findall(r"\b[A-Z]{3}-\d{3}\b", final_text)
-        cur_id = (station or {}).get("id")
-        if cur_id and any(x != cur_id for x in other_ids):
-            yield {"type": "log", "channel": "guard", "message": f"发现疑似串台ID: {', '.join(set(other_ids))}，仅回答 {cur_id}"}
-    except Exception:
-        pass
-
-    for piece in chunk_text(final_text or ""):
-        yield {"type": "token", "delta": piece}
+    # （可选）在此对 ''.join(buf) 做 split_think_and_final/后验校验
     yield {"type": "end"}
+
 
 
 
@@ -777,7 +880,16 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
 async def chat_stream(payload: Dict[str, Any] = Body(...)):
     messages = payload.get("messages") or []
     ctx = payload.get("context") or None
-    return StreamingResponse(sse(agent_stream(messages, context=ctx)), media_type="text/event-stream")
+    return StreamingResponse(
+        sse(agent_stream(messages, context=ctx)),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 @app.post("/api/chat")
 def chat_once(payload: Dict[str, Any] = Body(...)):
