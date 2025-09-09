@@ -18,38 +18,30 @@ import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 
 
+const PlotlyChart = dynamic(() => import("@/components/ui/PlotlyChart"), { ssr: false });
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
-// 可选：地图库（Leaflet）。如果在你环境中不可用，可把 MapPane 替换成自定义的占位卡片。
-// 预设假数据：北京基站（示例坐标非真实，仅用于 UI 演示）。
-const demoStations = [
-  { id: "BTS-001", name: "朝阳-望京2号站", lat: 39.9925, lng: 116.4747, vendor: "Huawei", band: "n78", status: "online" },
-  { id: "BTS-002", name: "海淀-中关村西", lat: 39.9834, lng: 116.3162, vendor: "ZTE", band: "n41", status: "online" },
-  { id: "BTS-003", name: "东城-王府井北", lat: 39.9166, lng: 116.4126, vendor: "Ericsson", band: "n1", status: "maintenance" },
-  { id: "BTS-004", name: "丰台-丽泽东", lat: 39.8623, lng: 116.3005, vendor: "Nokia", band: "n28", status: "offline" },
-];
-
 /**
  * 事件总线（左右联动）
  */
 const BusCtx = createContext({
-  emit: (type, payload) => {},
-  on: (type, handler) => {},
+  emit: (type: any, payload: any) => {},
+  on: (type: any, handler: any) => {},
 });
 
 function useEventBus() {
   const handlers = useRef(new Map());
   const api = useMemo(
     () => ({
-      emit: (type, payload) => {
-        (handlers.current.get(type) || []).forEach((h) => h(payload));
+      emit: (type: any, payload: any) => {
+        (handlers.current.get(type) || []).forEach((h: (arg0: any) => any) => h(payload));
       },
-      on: (type, handler) => {
+      on: (type: any, handler: any) => {
         if (!handlers.current.has(type)) handlers.current.set(type, []);
         handlers.current.get(type).push(handler);
         return () => {
           handlers.current.set(
             type,
-            (handlers.current.get(type) || []).filter((f) => f !== handler)
+            (handlers.current.get(type) || []).filter((f: any) => f !== handler)
           );
         };
       },
@@ -174,6 +166,9 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
   const inThinkXmlRef   = useRef<boolean>(false);   // <think> ... </think>
   const inThinkFenceRef = useRef<boolean>(false);   // ```think / ```thought / ```reasoning
   const thinkBufRef     = useRef<string>("");       // 累积 think 文本
+
+  const lastAssistantTextRef = useRef<string>(""); // 记录最新助手文本（给结束时解析 plotly）
+
 
   const [messages, setMessages] = useState([
     { role: "assistant", content: "你好，我是你的现场 Agent。你可以问：‘我想看看北京的基站’。" },
@@ -309,6 +304,7 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
     // 先插入“空气泡”，并记录索引到 ref
     setMessages((m) => {
       assistantIndexRef.current = m.length;
+      lastAssistantTextRef.current = "";
       return [...m, { role: "assistant" as const, content: "", meta: {} }];
     });
   
@@ -356,12 +352,17 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
             if (!clean) return; // 这片要么在 think 内，要么被完全剥离
           
             const i = assistantIndexRef.current;
+            lastAssistantTextRef.current += clean; // ← 新增
             setMessages((m) => {
               if (i < 0 || i >= m.length) return m;
               const copy = m.slice();
               copy[i] = { ...(copy[i] as any), content: (copy[i] as any).content + clean };
               return copy;
             });
+            return;
+          }
+          if (ev.type === "tool" && ev.tool === "plotly") {
+            bus.emit("charts:show", { spec: ev.spec, specs: ev.specs, title: ev.title || "AI 生成图表" });
             return;
           }
           
@@ -384,8 +385,17 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
           }
   
           if (ev.type === "end") {
+            // 结束前，尝试从最后助手文本里解析 ```plotly 代码块
+            try {
+              const text = lastAssistantTextRef.current || "";
+              const m = text.match(/```plotly\s*([\s\S]*?)```/i);
+              if (m) {
+                const spec = JSON.parse(m[1]);
+                bus.emit("charts:show", { spec, title: "AI 生成图表" });
+              }
+            } catch {}
             // 正常结束
-            throw new DOMException("done", "AbortError"); // 统一跳出 while
+            throw new DOMException("done", "AbortError");
           }
         }
       };
@@ -428,7 +438,7 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
   }, [bus, sendToAgent]);
 
   useEffect(() => {
-    const off = bus.on("station:selected", (station) => {
+    const off = bus.on("station:selected", (station: { name: any; id: any; }) => {
       setMessages((m) => [
         ...m,
         {
@@ -495,22 +505,30 @@ function ToolPane() {
   const [city, setCity] = useState("北京"); // ✅ 新增：当前城市
   const [logs, setLogs] = useState<Array<{channel:string; message:string; t:number}>>([]);
   const [coverageReq, setCoverageReq] = useState<{station_id:string} | null>(null); // ✅ 新增
+  const [chartSpec, setChartSpec] = useState<any | null>(null); // ← 新增
+
 
 
   useEffect(() => {
-    const off1 = bus.on("tool:map:load", (payload) => { setActiveTab("map"); setMapQuery(payload); });
-    const off2 = bus.on("tool:inspect", (data) => { setActiveTab("inspect"); setInspecting(data); });
-    const off3 = bus.on("log:append", (log) => {
+    const off1 = bus.on("tool:map:load", (payload: React.SetStateAction<null>) => { setActiveTab("map"); setMapQuery(payload); });
+    const off2 = bus.on("tool:inspect", (data: React.SetStateAction<null>) => { setActiveTab("inspect"); setInspecting(data); });
+    const off3 = bus.on("log:append", (log: { channel: any; message: any; }) => {
       setLogs((L) => [...L, { channel: log.channel || "info", message: log.message || String(log), t: Date.now() }]);
     });
     // ✅ 新增：监听“估算覆盖”
-    const off4 = bus.on("tool:run", (req) => {
+    const off4 = bus.on("tool:run", (req: { name: string; args: { id: any; }; }) => {
       if (req?.name === "coverage" && req?.args?.id) {
         setCoverageReq({ station_id: req.args.id });
         setActiveTab("coverage");
       }
     });
-    return () => { off1 && off1(); off2 && off2(); off3 && off3(); off4 && off4(); };
+    const off5 = bus.on("charts:show", ({ spec, specs, title }) => {
+      setChartSpec(specs ?? spec);
+      setActiveTab("charts");
+    });
+    
+    return () => { off1 && off1(); off2 && off2(); off3 && off3(); off4 && off4(); off5 && off5();
+    };
   }, [bus]);
 
   return (
@@ -528,6 +546,8 @@ function ToolPane() {
               <TabsTrigger value="search">检索</TabsTrigger> {/* ✅ 改为 DB 检索 */}
               <TabsTrigger value="coverage" className="p-4 h-full">覆盖</TabsTrigger> {/* ✅ 新增 */}
               <TabsTrigger value="log">日志</TabsTrigger>
+              <TabsTrigger value="charts">图表</TabsTrigger>
+
             </TabsList>
 
             {/* ✅ 城市选择器（简单版） */}
@@ -545,7 +565,7 @@ function ToolPane() {
             <MapPane
               city={city}                       // ✅ 传 city
               query={mapQuery}
-              onSelectStation={(s)=>{
+              onSelectStation={(s: any)=>{
                 bus.emit("station:selected", s);
                 bus.emit("tool:inspect", s);
               }}
@@ -578,6 +598,29 @@ function ToolPane() {
           <TabsContent value="log" className="p-4">
             <LogsPane logs={logs} />
           </TabsContent>
+
+          <TabsContent value="charts" className="p-4">
+            {chartSpec ? (
+              Array.isArray(chartSpec) ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {chartSpec.map((it, idx) => (
+                    <div key={idx} className="h-80 md:h-96 border rounded-xl p-2">
+                      <div className="text-sm font-medium mb-2">{it.title}</div>
+                      <PlotlyChart {...it.spec} />
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="h-80 md:h-96 border rounded-xl p-2">
+                  <PlotlyChart {...chartSpec} />
+                </div>
+              )
+            ) : (
+              <Placeholder title="暂无图表" desc="在聊天中说：‘北京 3D 基站图 / 北京全部图 / 北京厂商水平条形图’ 等" />
+            )}
+          </TabsContent>
+
+
         </Tabs>
       </CardContent>
     </Card>
@@ -1065,7 +1108,7 @@ export default function AgentWorkbench() {
   const bus = useEventBus();
 
   useEffect(() => {
-    const off = bus.on("chat:ask", (q) => {
+    const off = bus.on("chat:ask", (q: any) => {
       bus.emit("station:selected", { id: "BTS-001", name: "朝阳-望京2号站", suggest: q });
     });
     return () => off && off();

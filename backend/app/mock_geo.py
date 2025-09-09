@@ -61,7 +61,7 @@ def seed(seed_value: Optional[int] = None):
         GEO[city] = {
             "code": code,
             "center": {"lat": center[0], "lng": center[1]},
-            "stations": _gen_stations(city, code, center, n=8),
+            "stations": _gen_stations(city, code, center, n=16),
         }
 
 def list_cities() -> List[Dict]:

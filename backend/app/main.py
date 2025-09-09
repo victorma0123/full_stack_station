@@ -2,7 +2,6 @@
 
 # app/main.py
 import json
-import re
 from typing import Any, Dict, List, AsyncGenerator
 from fastapi import FastAPI, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +15,8 @@ from fastapi import Request
 import base64
 import httpx
 import asyncio
+from collections import Counter
+
 
 #from app import rag_store
 
@@ -44,6 +45,8 @@ agent = Agent(
 
 # ===== 放在 main.py 顶部其它函数旁 =====
 import re
+from . import chart_specs
+
 
 async def stream_from_ollama(prompt: str):
     """
@@ -173,14 +176,20 @@ def extract_station_id(prompt: str) -> str | None:
     return f"{prefix}-{num}"
 
 
+# 放在 main.py 里（或你定义 want_list 的地方）
 LIST_HINT = ["有哪些", "都有什么", "列出", "清单", "罗列", "list", "所有", "全部"]
+VIS_HINT_RE = re.compile(r"(出图|图表|可视化|柱状|折线|饼图|plot|chart|bar)", re.I)
 
 def want_list(prompt: str) -> bool:
-    """更精准：明确列举意图，或 '城市+基站' 组合再认为是清单请求。"""
-    p = (prompt or "").lower()
+    p = prompt or ""
+    if VIS_HINT_RE.search(p):              # 有可视化意图 → 不走清单
+        return False
+    has_city = extract_city(p) is not None
     listy = any(h in p for h in LIST_HINT)
-    has_city = extract_city(prompt) is not None
+    # 恢复“城市+基站”的兜底（且不含可视化意图时）
     return listy or (has_city and "基站" in p)
+
+
 
 def station_to_markdown(st: dict) -> str:
     if not st: return "未找到该基站。"
@@ -202,7 +211,6 @@ def station_to_markdown(st: dict) -> str:
         osm = f"https://www.openstreetmap.org/?mlat={lat}&mlon={lng}#map=16/{lat}/{lng}"
         lines += ["", f"[在 OpenStreetMap 查看]({osm})"]
     return "\n".join(lines)
-from collections import Counter
 def _md_table(header_cols, rows):
     head = "| " + " | ".join(header_cols) + " |"
     sep  = "|" + "|".join(["---"] * len(header_cols)) + "|"
@@ -806,6 +814,33 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
             yield {"type": "token", "delta": line}
         yield {"type": "end"}
         return
+        
+# ✅ 3D 意图优先匹配（放在城市清单直答之前）
+    if re.search(r"(3d|三维|立体|体渲染|体积|等值面|等高|模拟)", prompt or "", re.I):
+        city3d = extract_city(prompt or "") or "北京"
+        rows3d = db_json.search_stations(city=city3d, limit=1000)
+        title, spec = chart_specs.spec_3d_city_density_surface(rows3d, city3d)
+        yield {"type": "tool", "tool": "plotly", "title": title, "spec": spec}
+        yield {"type": "end"}; return
+
+    
+        # 放在 2D 分支 (chart_specs.VIS_HINT_RE) 之前
+    if re.search(r"(全部|所有|全套).*(图|图表)", prompt or "", re.I):
+        city_all = extract_city(prompt or "") or "北京"
+        rows_all = db_json.search_stations(city=city_all, limit=1000)
+        specs = chart_specs.make_all_specs(rows_all, city_all)
+        yield {"type": "tool", "tool": "plotly", "title": f"{city_all} 可视化总览", "specs": specs}
+        yield {"type": "end"}; return
+
+# === 可视化意图：用户说“出图/柱状图/图表/plot/bar/chart”等，直接返回 Plotly 规范 ===
+    if chart_specs.VIS_HINT_RE.search(prompt or ""):
+        city4plot = extract_city(prompt or "") or "北京"
+        rows = db_json.search_stations(city=city4plot, limit=1000)
+        title, spec = chart_specs.pick_spec(prompt or "", rows, city4plot)
+        yield {"type":"tool","tool":"plotly","title": title, "spec": spec}
+        yield {"type":"end"}
+        return
+
     
     # ★ 1.5) 城市清单直答（例如“北京有哪些基站/北京的基站”）
     city = extract_city(prompt or "")
