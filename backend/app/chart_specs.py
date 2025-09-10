@@ -100,9 +100,11 @@ def spec_updated_at_hist(rows: List[Dict], city: str) -> Tuple[str, Dict]:
 # --------- 根据关键词选择图表 ---------
 
 VIS_HINT_RE = re.compile(
-    r"(出图|可视化|图表|统计|分布|柱状|柱状图|饼图|甜甜圈|donut|折线|直方|热力|堆叠|条形|水平|横向|barh|hbar|bar|pie|line|hist|heatmap|stack)",
+    r"(出图|可视化|图表|统计|分布|柱状图?|饼图|甜甜圈|donut|折线|直方|热力|堆叠|条形|水平|横向|barh|hbar|bar|pie|line|hist|heatmap|stack|"
+    r"全部\s*(图|图表)|所有\s*(图|图表)|全套\s*(图|图表)|全图|全部图|总览图|overview)",
     re.I
 )
+
 def pick_spec(prompt: str, rows: List[Dict], city: str) -> Tuple[str, Dict]:
     p = prompt or ""
     if re.search(r"(甜甜圈|donut)", p, re.I):

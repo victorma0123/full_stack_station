@@ -27,6 +27,44 @@ from strands.models.ollama import OllamaModel
 import hashlib
 from math import isnan
 
+# === 图表解读小工具 ===
+def _aggregate_stats(rows: list[dict]) -> dict:
+    from collections import Counter
+    import math, statistics as st
+    vendors = Counter([(r.get("vendor") or "未知") for r in rows])
+    statuses = Counter([(r.get("status") or "未知").lower() for r in rows])
+    bands = Counter([(r.get("band") or "未知") for r in rows])
+    times = [int(r.get("updated_at") or 0) for r in rows if r.get("updated_at")]
+    hist = None
+    if times:
+        times_sorted = sorted(times)
+        hist = {
+            "min": times_sorted[0],
+            "p50": times_sorted[len(times_sorted)//2],
+            "max": times_sorted[-1],
+            "mean": int(st.mean(times)),
+        }
+    top_vendor = vendors.most_common(1)[0][0] if vendors else None
+    return {
+        "n": len(rows),
+        "vendor_counts": dict(vendors),
+        "status_counts": dict(statuses),
+        "band_counts": dict(bands),
+        "updated_at_summary": hist,
+        "top_vendor": top_vendor,
+    }
+
+def _classify_kind(prompt: str) -> str:
+    p = prompt or ""
+    if re.search(r"(甜甜圈|donut)", p, re.I): return "donut"
+    if re.search(r"(饼图|pie)", p, re.I): return "pie"
+    if re.search(r"(热力|heatmap)", p, re.I): return "heatmap"
+    if re.search(r"(堆叠|stack)", p, re.I): return "stacked"
+    if re.search(r"(直方|hist)", p, re.I): return "hist"
+    if re.search(r"(水平|horizontal|barh|hbar)", p, re.I): return "horizontal"
+    return "bar"  # 默认柱状
+
+
 # 连接本地 Ollama（确保 ollama serve 在跑，且已 pull 对应模型）
 model = OllamaModel(
     host="http://127.0.0.1:11434",
@@ -824,22 +862,90 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
         yield {"type": "end"}; return
 
     
-        # 放在 2D 分支 (chart_specs.VIS_HINT_RE) 之前
-    if re.search(r"(全部|所有|全套).*(图|图表)", prompt or "", re.I):
-        city_all = extract_city(prompt or "") or "北京"
-        rows_all = db_json.search_stations(city=city_all, limit=1000)
-        specs = chart_specs.make_all_specs(rows_all, city_all)
-        yield {"type": "tool", "tool": "plotly", "title": f"{city_all} 可视化总览", "specs": specs}
-        yield {"type": "end"}; return
+
 
 # === 可视化意图：用户说“出图/柱状图/图表/plot/bar/chart”等，直接返回 Plotly 规范 ===
     if chart_specs.VIS_HINT_RE.search(prompt or ""):
         city4plot = extract_city(prompt or "") or "北京"
         rows = db_json.search_stations(city=city4plot, limit=1000)
+        stats = _aggregate_stats(rows)
+
+        # ① “全部/所有图” → 批量发图 + 总览解读
+        if re.search(r"(全部|所有|all|全图)", prompt or "", re.I):
+            items = chart_specs.make_all_specs(rows, city4plot)  # [{title, spec}, ...]
+            # 先把图批量发给前端（前端要支持 tool=plotly_batch，见下面前端改动）
+            yield {"type": "tool", "tool": "plotly_batch", "items": items, "title": f"{city4plot} 图表总览"}
+
+            # 再让模型写一段概览性解读（不必复述每个数字，讲“能看什么”）
+            facts_json = json.dumps({
+                "city": city4plot,
+                "n": stats["n"],
+                "vendors": stats["vendor_counts"],
+                "status": stats["status_counts"],
+                "bands": stats["band_counts"],
+            }, ensure_ascii=False)
+            explain_prompt = (
+                f"你是网络运营分析助手。请用中文给一组图表做**简短总览解读**，对象是{city4plot}的基站数据。\n"
+                f"数据事实(JSON)：{facts_json}\n"
+                "图表清单：厂商柱状图、在线状态饼图、频段甜甜圈、厂商×状态堆叠柱、厂商×频段热力图、状态水平条、更新时间直方图。\n"
+                "写 5-7 句：\n"
+                "1) 每个图大概能看什么，不要逐个罗列全部数字。\n"
+                "2) 指出最主要的对比/占比/异常（如某厂商占比最高，某状态占比低等）。\n"
+                "3) 风格简洁，避免形容词堆叠。"
+            )
+            async for delta in stream_from_ollama(explain_prompt):
+                yield {"type": "token", "delta": delta}
+            yield {"type":"end"}; return
+
+        # ② 单图 → 发图 + 针对该图的解读
         title, spec = chart_specs.pick_spec(prompt or "", rows, city4plot)
+        kind = _classify_kind(prompt or "")
+
+        # 先发图
         yield {"type":"tool","tool":"plotly","title": title, "spec": spec}
-        yield {"type":"end"}
-        return
+
+        # 再生成该图的解读（把相关数字塞给模型）
+        # 针对不同 kind 准备聚合事实
+        focus = {}
+        if kind in ("bar", "stacked"):
+            focus["vendor_counts"] = stats["vendor_counts"]
+            focus["status_counts"] = stats["status_counts"]
+        if kind in ("pie", "horizontal"):
+            focus["status_counts"] = stats["status_counts"]
+        if kind in ("donut",):
+            focus["band_counts"] = stats["band_counts"]
+        if kind in ("heatmap",):
+            # 为简洁起见，给出二维矩阵的“非零格数”和行/列关键统计
+            from collections import defaultdict
+            vendors = sorted(stats["vendor_counts"].keys())
+            bands = sorted(stats["band_counts"].keys())
+            mat = defaultdict(dict)
+            for v in vendors:
+                for b in bands:
+                    mat[v][b] = sum(1 for r in rows if (r.get("vendor") or "未知")==v and (r.get("band") or "未知")==b)
+            focus["vendor_band_nonzero"] = sum(1 for v in vendors for b in bands if mat[v][b] > 0)
+            focus["vendors"] = vendors
+            focus["bands"] = bands
+        if kind in ("hist",):
+            focus["updated_at_summary"] = stats["updated_at_summary"]
+
+        facts_json = json.dumps({
+            "city": city4plot,
+            "kind": kind,
+            "n": stats["n"],
+            **focus
+        }, ensure_ascii=False)
+
+        explain_prompt = (
+            f"你是网络运营分析助手。现在用户让你生成“{title}”。\n"
+            f"请用中文写 3-5 句，说明：这个图是什么、它展示了什么维度、读图时应关注哪些对比或占比、并给出 1-2 条简要洞见。\n"
+            f"不要复述全部数字，只点出核心结论。避免无意义的套话。城市：{city4plot}。\n"
+            f"补充数据(JSON)：{facts_json}"
+        )
+        async for delta in stream_from_ollama(explain_prompt):
+            yield {"type": "token", "delta": delta}
+        yield {"type":"end"}; return
+
 
     
     # ★ 1.5) 城市清单直答（例如“北京有哪些基站/北京的基站”）
