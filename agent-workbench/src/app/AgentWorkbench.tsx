@@ -12,10 +12,14 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { MapPin, Send, PlayCircle, Globe2, Wrench, Bot } from "lucide-react";
 import { motion } from "framer-motion";
-import { useMap } from "react-leaflet";
-import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import rehypeRaw from "rehype-raw";
+import type { Map as mp } from "leaflet";
+import type { MapContainerProps } from "react-leaflet";
+import type { Layout, Config, Data } from "plotly.js";
+import ReactMarkdown, { type Components } from "react-markdown";
+
+
+
 
 
 const PlotlyChart = dynamic(() => import("@/components/ui/PlotlyChart"), { ssr: false });
@@ -23,38 +27,107 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 /**
  * 事件总线（左右联动）
  */
-const BusCtx = createContext({
-  emit: (type: any, payload: any) => {},
-  on: (type: any, handler: any) => {},
+type ChatMeta = {
+  suggest?: string;          // 你现在就是传字符串
+  channel?: string;          // 你下方用了 meta?.channel === 'router'
+  // 还要保留“以后可扩展”的自由：
+  [key: string]: unknown;
+};
+
+type ChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+  meta?: ChatMeta;
+};
+// 统一的 Bus 类型（参数必填；on 返回取消订阅函数）
+type EventHandler = (payload: unknown) => void;
+type BusAPI = {
+  emit: (type: string, payload: unknown) => void;
+  on: (type: string, handler: EventHandler) => () => void;
+};
+
+// 用正确的类型创建 Context，并提供能返回“取消订阅函数”的默认实现
+const BusCtx = createContext<BusAPI>({
+  emit: () => {},
+  on: () => () => {}, // 注意这里返回一个空函数，签名对齐
 });
 
 function useEventBus() {
-  const handlers = useRef(new Map());
+  type EventHandler = (payload: unknown) => void;
+
+  // handlers: Map<事件名, 事件处理器数组>
+  const handlers = useRef<Map<string, EventHandler[]>>(new Map());
+
   const api = useMemo(
     () => ({
-      emit: (type: any, payload: any) => {
-        (handlers.current.get(type) || []).forEach((h: (arg0: any) => any) => h(payload));
+      emit: (type: string, payload: unknown) => {
+        (handlers.current.get(type) || []).forEach((h) => h(payload));
       },
-      on: (type: any, handler: any) => {
-        if (!handlers.current.has(type)) handlers.current.set(type, []);
-        handlers.current.get(type).push(handler);
+      on: (type: string, handler: EventHandler) => {
+        if (!handlers.current.has(type)) {
+          handlers.current.set(type, []);
+        }
+        handlers.current.get(type)!.push(handler);
+
         return () => {
           handlers.current.set(
             type,
-            (handlers.current.get(type) || []).filter((f: any) => f !== handler)
+            (handlers.current.get(type) || []).filter((f) => f !== handler)
           );
         };
       },
     }),
     []
   );
+
   return api;
 }
+
 
 /**
  * Chat 消息结构
  */
-function ChatBubble({ role, content, meta }) {
+
+// 1) 明确声明 components 的类型
+type MDCodeProps = React.HTMLAttributes<HTMLElement> & {
+  inline?: boolean;
+  className?: string;
+  children?: React.ReactNode;
+};
+
+const CodeRenderer = (props: MDCodeProps) => {
+  const { inline, className, children, ...rest } = props;
+  if (inline) {
+    return (
+      <code className="font-mono px-1 py-0.5 bg-muted rounded" {...rest}>
+        {children}
+      </code>
+    );
+  }
+  return (
+    <code className="block font-mono text-xs p-3 bg-muted rounded overflow-x-auto" {...rest}>
+      {children}
+    </code>
+  );
+};
+
+const mdComponents: Components = {
+  table: (props) => <table className="table-fixed w-full border border-border text-sm my-3" {...props} />,
+  thead: (props) => <thead className="bg-muted/60" {...props} />,
+  th: (props) => <th className="border border-border px-6 py-2 text-left font-medium" {...props} />,
+  td: (props) => <td className="border border-border px-6 py-2 align-top" {...props} />,
+  h1: (props) => <h1 className="text-lg font-semibold mt-4 mb-2" {...props} />,
+  h2: (props) => <h2 className="text-base font-semibold mt-3 mb-1.5" {...props} />,
+  ul:  (props) => <ul className="list-disc pl-5 space-y-1" {...props} />,
+  ol:  (props) => <ol className="list-decimal pl-5 space-y-1" {...props} />,
+  li:  (props) => <li className="leading-relaxed" {...props} />,
+  a:   (props) => <a {...props} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline" />,
+
+  // 关键：用我们自己的 CodeRenderer，并用 unknown 做类型桥接（不是 any）
+  code: CodeRenderer as unknown as Components["code"],
+};
+
+function ChatBubble({ role, content, meta }: ChatMessage) {
   const isUser = role === "user";
   const isRouter = meta?.channel === "router";
 
@@ -72,74 +145,9 @@ function ChatBubble({ role, content, meta }) {
             isRouter ? "prose-router" : ""
           }`}
         >
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-    
-            components={{
-              table: ({ node, ...props }) => (
-                <table
-                  className="table-fixed w-full border border-border text-sm my-3"
-                  {...props}
-                />
-              ),
-              thead: ({ node, ...props }) => (
-                <thead className="bg-muted/60" {...props} />
-              ),
-              th: ({ node, ...props }) => (
-                <th
-                  className="border border-border px-6 py-2 text-left font-medium"
-                  {...props}
-                />
-              ),
-              td: ({ node, ...props }) => (
-                <td
-                  className="border border-border px-6 py-2 align-top"
-                  {...props}
-                />
-              ),
-              code: ({ inline, className, children, ...props }) =>
-                inline ? (
-                  <code
-                    className="font-mono px-1 py-0.5 bg-muted rounded"
-                    {...props}
-                  >
-                    {children}
-                  </code>
-                ) : (
-                  <code
-                    className="block font-mono text-xs p-3 bg-muted rounded overflow-x-auto"
-                    {...props}
-                  >
-                    {children}
-                  </code>
-                ),
-              h1: ({ node, ...props }) => (
-                <h1 className="text-lg font-semibold mt-4 mb-2" {...props} />
-              ),
-              h2: ({ node, ...props }) => (
-                <h2 className="text-base font-semibold mt-3 mb-1.5" {...props} />
-              ),
-              ul: ({ node, ...props }) => (
-                <ul className="list-disc pl-5 space-y-1" {...props} />
-              ),
-              ol: ({ node, ...props }) => (
-                <ol className="list-decimal pl-5 space-y-1" {...props} />
-              ),
-              li: ({ node, ...props }) => (
-                <li className="leading-relaxed" {...props} />
-              ),
-              a: ({ node, ...props }) => (
-                <a
-                  {...props}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-blue-600 underline"
-                />
-              ),
-            }}
-          >
-            {content}
-          </ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+          {content}
+        </ReactMarkdown>
         </div>
 
         {meta?.suggest && (
@@ -170,7 +178,7 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
   const lastAssistantTextRef = useRef<string>(""); // 记录最新助手文本（给结束时解析 plotly）
 
 
-  const [messages, setMessages] = useState([
+  const [messages, setMessages] = useState<ChatMessage[]>([
     { role: "assistant", content: "你好，我是你的现场 Agent。你可以问：‘我想看看北京的基站’。" },
   ]);
   const [input, setInput] = useState("");
@@ -266,7 +274,38 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
     return () => cancelAnimationFrame(id);
   }, [messages]);
 
-  const sendToAgent = useCallback(async (text: string, ctx?: any) => {
+// 顶部补这些类型（放在文件内、ToolPane 上方即可）
+
+type Station = {
+  id: string;
+  name: string;
+  vendor?: string;
+  band?: string;
+  status?: string;
+  lat?: number;
+  lng?: number;
+  desc?: string;
+};
+
+
+
+
+
+  
+  interface AgentContext {
+    station?: Station;
+    [key: string]: unknown; // 允许以后加更多字段
+  }
+  type StreamEvent =
+  | { type: "start" }
+  | { type: "end" }
+  | { type: "token"; delta: string }
+  | { type: "log"; channel?: string; message: string }
+  | { type: "tool"; tool: "plotly"; spec: unknown; specs?: unknown[]; title?: string }
+  | { type: "tool"; tool: "plotly_batch"; items: Array<{ title?: string; spec: unknown }>; title?: string };
+
+  
+  const sendToAgent = useCallback(async (text: string, ctx?: AgentContext) => {
     const ask = text.trim();
     if (!ask) return;
   
@@ -279,7 +318,7 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
   
     // /clear
     if (/^\/?clear$/i.test(ask)) {
-      const initial = [
+      const initial: ChatMessage[] = [
         { role: "assistant", content: "你好，我是你的现场 Agent。你可以问：‘我想看看北京的基站’。" },
       ];
       setMessages(initial);
@@ -342,7 +381,7 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
           const jsonStr = line.slice(5).trim();
           if (!jsonStr) continue;
   
-          let ev: any;
+          let ev: StreamEvent;
           try { ev = JSON.parse(jsonStr); } catch { continue; }
   
           if (ev.type === "start") return;
@@ -355,8 +394,11 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
             lastAssistantTextRef.current += clean; // ← 新增
             setMessages((m) => {
               if (i < 0 || i >= m.length) return m;
-              const copy = m.slice();
-              copy[i] = { ...(copy[i] as any), content: (copy[i] as any).content + clean };
+              const copy = [...m];
+              const current = copy[i];
+              if (current.role === "assistant") {
+                copy[i] = { ...(copy[i]), content: (copy[i]).content + clean };
+              }
               return copy;
             });
             return;
@@ -381,8 +423,8 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
                 if (i < 0 || i >= m.length) return m;
                 const copy = m.slice();
                 copy[i] = {
-                  ...(copy[i] as any),
-                  meta: { ...((copy[i] as any).meta || {}), channel: "router" },
+                  ...(copy[i]),
+                  meta: { ...((copy[i]).meta || {}), channel: "router" },
                 };
                 return copy;
               });
@@ -419,32 +461,52 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
           flushEvent(evt);
         }
       }
-    } catch (err: any) {
-      // “正常结束”走了 AbortError(done)，不要报错
-      if (!(err instanceof DOMException && err.name === "AbortError")) {
-        setMessages((m) => [...m, { role: "assistant", content: `流式异常：${String(err?.message || err)}` }]);
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        // 这是正常结束，不算错误
+      } else {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : typeof err === "string"
+            ? err
+            : JSON.stringify(err);
+    
+        setMessages((m) => [
+          ...m,
+          { role: "assistant", content: `流式异常：${msg}` },
+        ]);
       }
-    } finally {
+    }
+    
+    finally {
       setStreamActive(false);
       controllerRef.current = null;
       requestAnimationFrame(() => endRef.current?.scrollIntoView({ block: "end" }));
     }
+    
   }, [bus, messages, streamActive]);
   
   useEffect(() => {
-    const off = bus.on("chat:ask-station", ({ station, question }) => {
+    const off = bus.on("chat:ask-station", (payload) => {
+      const { station, question } = payload as { station: Station; question: string };
+  
       fetch("/api/geo/selection", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ station_id: station.id, session_id: "demo" }),
-      }).catch(()=>{});
+      }).catch(() => {});
+  
       sendToAgent(question, { station });
     });
+  
     return () => off && off();
   }, [bus, sendToAgent]);
-
+  
+  
   useEffect(() => {
-    const off = bus.on("station:selected", (station: { name: any; id: any; }) => {
+    const off = bus.on("station:selected", (payload) => {
+      const station = payload as Station;
       setMessages((m) => [
         ...m,
         {
@@ -503,37 +565,65 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
 /**
  * 右侧：工具工作台（Tabs 切换 Map / Inspector / Logs）
  */
+type PlotlySpec = {
+  data?: Data[];
+  layout?: Partial<Layout>;
+  config?: Partial<Config>;
+};
+type BusEvents = {
+  "tool:map:load": { query: string; city: string };
+  "tool:inspect": Station;
+  "log:append": { channel?: string; message: string };
+  "tool:run": { name: string; args: { id: string } };
+  "charts:show": { spec?: PlotlySpec; specs?: Array<{ title: string; spec: PlotlySpec }>; title?: string };
+  "charts:show-batch": { items: Array<{ title: string; spec: PlotlySpec }> };
+  "station:selected": Station;
+};
+
+type EventBus<E> = {
+  emit<K extends keyof E & string>(type: K, payload: E[K]): void;
+  on<K extends keyof E & string>(type: K, handler: (payload: E[K]) => void): () => void;
+};
+
 function ToolPane() {
-  const bus = useContext(BusCtx);
-  const [activeTab, setActiveTab] = useState("map");
-  const [inspecting, setInspecting] = useState(null);
-  const [mapQuery, setMapQuery] = useState(null);
+  const bus = useContext(BusCtx) as EventBus<BusEvents>;
+
+  const [activeTab, setActiveTab] = useState<"map" | "inspect" | "search" | "coverage" | "log" | "charts">("map");
+  const [inspecting, setInspecting] = useState<Station | null>(null);
+  const [mapQuery, setMapQuery] = useState<{ query: string; city: string } | null>(null);
   const [city, setCity] = useState("北京");
   const [logs, setLogs] = useState<Array<{ channel: string; message: string; t: number }>>([]);
   const [coverageReq, setCoverageReq] = useState<{ station_id: string } | null>(null);
-  const [chartItems, setChartItems] = useState<Array<{ title: string; spec: any }>>([]);
+  const [chartItems, setChartItems] = useState<Array<{ title: string; spec: PlotlySpec }>>([]);
 
   // 图表区滚动容器，用于切到“图表”时回到顶部
   const chartsAreaRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    const off1 = bus.on("tool:map:load", (payload: any) => {
+    const off1 = bus.on("tool:map:load", (payload) => {
       setActiveTab("map");
       setMapQuery(payload);
     });
-    const off2 = bus.on("tool:inspect", (data: any) => {
+
+    const off2 = bus.on("tool:inspect", (data) => {
       setActiveTab("inspect");
       setInspecting(data);
     });
-    const off3 = bus.on("log:append", (log: { channel: any; message: any }) => {
-      setLogs((L) => [...L, { channel: log.channel || "info", message: log.message || String(log), t: Date.now() }]);
+
+    const off3 = bus.on("log:append", (log) => {
+      setLogs((L) => [
+        ...L,
+        { channel: log.channel || "info", message: log.message, t: Date.now() },
+      ]);
     });
-    const off4 = bus.on("tool:run", (req: { name: string; args: { id: any } }) => {
+
+    const off4 = bus.on("tool:run", (req) => {
       if (req?.name === "coverage" && req?.args?.id) {
         setCoverageReq({ station_id: req.args.id });
         setActiveTab("coverage");
       }
     });
+
     const off5 = bus.on("charts:show", ({ spec, specs, title }) => {
       const items = Array.isArray(specs)
         ? specs
@@ -543,6 +633,7 @@ function ToolPane() {
       setChartItems(items);
       setActiveTab("charts");
     });
+
     const off6 = bus.on("charts:show-batch", ({ items }) => {
       setChartItems(items);
       setActiveTab("charts");
@@ -558,10 +649,10 @@ function ToolPane() {
     };
   }, [bus]);
 
-  // 切换到“图表”或图表内容变化时，将滚动置顶
+  // 切到“图表”或图表内容变化时，将滚动置顶
   useEffect(() => {
     if (activeTab !== "charts") return;
-    const root = chartsAreaRef.current as HTMLDivElement | null;
+    const root = chartsAreaRef.current;
     const viewport = root?.querySelector('[data-radix-scroll-area-viewport]') as HTMLDivElement | null;
     if (viewport) viewport.scrollTop = 0;
   }, [activeTab, chartItems]);
@@ -575,7 +666,7 @@ function ToolPane() {
       </CardHeader>
       <Separator />
       <CardContent className="p-0 h-full flex flex-col min-h-0">
-        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full h-full flex flex-col">
+        <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as typeof activeTab)} className="w-full h-full flex flex-col">
           {/* 顶部：固定不压缩 */}
           <div className="px-4 pt-3 flex items-center gap-2 shrink-0">
             <TabsList>
@@ -612,7 +703,7 @@ function ToolPane() {
               <MapPane
                 city={city}
                 query={mapQuery}
-                onSelectStation={(s: any) => {
+                onSelectStation={(s: Station) => {
                   bus.emit("station:selected", s);
                   bus.emit("tool:inspect", s);
                 }}
@@ -637,7 +728,7 @@ function ToolPane() {
 
             <TabsContent value="search" className="h-full p-4">
               <DbSearchPane
-                onPick={(s) => {
+                onPick={(s: Station) => {
                   bus.emit("tool:inspect", s);
                   bus.emit("station:selected", s);
                   setActiveTab("inspect");
@@ -678,6 +769,7 @@ function ToolPane() {
 }
 
 
+
 function Placeholder({ title = "占位", desc = "" }) {
   return (
     <div className="border rounded-xl p-6 text-sm text-muted-foreground">
@@ -690,8 +782,24 @@ function Placeholder({ title = "占位", desc = "" }) {
 /**
  * 地图面板：这里用占位 UI 来模拟（如要真地图，可接入 react-leaflet 或 MapboxGL）
  */
-function MapPane({ city, query, onSelectStation }) {
-  const [stations, setStations] = useState<any[]>([]);
+export interface Station {
+  id: string;
+  name: string;
+  vendor?: string;
+  band?: string;
+  status?: "online" | "maintenance" | "offline" | string;
+  lat?: number;
+  lng?: number;
+  desc?: string;
+  city?: string;
+}
+interface MapPaneProps {
+  city: string;
+  query: { query: string; city: string } | null;
+  onSelectStation?: (s: Station) => void;
+}
+function MapPane({ city, query, onSelectStation }: MapPaneProps) {
+  const [stations, setStations] = useState<Station[]>([]);
   const [loading, setLoading] = useState(false);
 
   const fetchStations = async () => {
@@ -750,7 +858,7 @@ function MapPane({ city, query, onSelectStation }) {
 }
 
 
-function Inspector({ data }: { data: any }) {
+function Inspector({ data }: { data: Station }) {
   const bus = useContext(BusCtx);
   return (
     <div className="space-y-3">
@@ -835,9 +943,9 @@ function LogsPane({ logs = [] as Array<{channel: string; message: string; t: num
     </div>
   );
 }
-function DbSearchPane({ onPick }:{ onPick:(station:any)=>void }) {
+function DbSearchPane({ onPick }:{ onPick:(station:Station)=>void }) {
   const [q, setQ] = useState("");
-  const [hits, setHits] = useState<any[]>([]);
+  const [hits, setHits] = useState<Station[]>([]);
   const [loading, setLoading] = useState(false);
 
   const search = async () => {
@@ -899,19 +1007,24 @@ const Marker = dynamic(() => import("react-leaflet").then(m => m.Marker), { ssr:
 const Circle = dynamic(() => import("react-leaflet").then(m => m.Circle), { ssr: false });
 const Popup = dynamic(() => import("react-leaflet").then(m => m.Popup), { ssr: false });
 function ResizeOnShow() {
-  const map = useMap();
+  const [map, setMap] = React.useState<mp | null>(null);
+
 
   React.useEffect(() => {
     if (!map) return;
 
     let alive = true;
     const safeInvalidate = () => {
-      // 1) 组件还在  2) map._mapPane 已创建（Leaflet 初始化完成）
-      // @ts-ignore
-      if (!alive || !map || !(map as any)._mapPane) return;
+      // `_mapPane` 是 Leaflet 内部私有属性，类型声明里没有
+      // 所以这里用 @ts-expect-error 注解掉
+      // @ts-expect-error: _mapPane is a private Leaflet field, not in type definitions
+      if (!alive || !map || !map._mapPane) return;
+    
       try {
         map.invalidateSize();
-      } catch {}
+      } catch {
+        // ignore
+      }
     };
 
     // 优先等待 Leaflet 就绪再触发
@@ -924,12 +1037,10 @@ function ResizeOnShow() {
 
     // 再监听一次 'load'（某些瓦片/样式异步时更稳）
     const onLoad = () => requestAnimationFrame(safeInvalidate);
-    // @ts-ignore
     map.on("load", onLoad);
 
     return () => {
       alive = false;
-      // @ts-ignore
       map.off("load", onLoad);
     };
   }, [map]);
@@ -938,7 +1049,8 @@ function ResizeOnShow() {
 }
 
 // 放在文件中（与 ResizeOnShow 同级）
-function UseResizeInvalidate({ mapRef }: { mapRef: React.MutableRefObject<any> }) {
+// 1) UseResizeInvalidate：允许 null
+function UseResizeInvalidate({ mapRef }: { mapRef: React.MutableRefObject<mp | null> }) {
   const boxRef = React.useRef<HTMLDivElement | null>(null);
 
   React.useEffect(() => {
@@ -947,8 +1059,8 @@ function UseResizeInvalidate({ mapRef }: { mapRef: React.MutableRefObject<any> }
 
     const safeInvalidate = () => {
       const map = mapRef.current;
-      // @ts-ignore
-      if (!alive || !map || !(map as any)._mapPane) return;
+      // @ts-expect-error: _mapPane is private
+      if (!alive || !map || !map._mapPane) return;
       try { map.invalidateSize(); } catch {}
     };
 
@@ -957,42 +1069,58 @@ function UseResizeInvalidate({ mapRef }: { mapRef: React.MutableRefObject<any> }
     });
     ro.observe(boxRef.current);
 
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries[0]?.isIntersecting) {
-          requestAnimationFrame(() => {
-            requestAnimationFrame(safeInvalidate);
-          });
-        }
-      },
-      { threshold: 0.1 }
-    );
+    const io = new IntersectionObserver((entries) => {
+      if (entries[0]?.isIntersecting) {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(safeInvalidate);
+        });
+      }
+    }, { threshold: 0.1 });
     io.observe(boxRef.current);
 
     return () => { alive = false; ro.disconnect(); io.disconnect(); };
   }, [mapRef]);
 
-  return (props: { className?: string; children: React.ReactNode }) => (
-    <div ref={boxRef} className={props.className}>{props.children}</div>
+  const ResizeWrapper: React.FC<{ className?: string; children: React.ReactNode }> = (props) => (
+    <div ref={boxRef} className={props.className}>
+      {props.children}
+    </div>
   );
+  ResizeWrapper.displayName = "ResizeWrapper";
+  return ResizeWrapper;
 }
 
 
+// 这些图片用 ESM 导入没问题（不会触发 window）
+import iconUrl from "leaflet/dist/images/marker-icon.png";
+import iconRetinaUrl from "leaflet/dist/images/marker-icon-2x.png";
+import shadowUrl from "leaflet/dist/images/marker-shadow.png";
+
+// 仅在浏览器端初始化 Leaflet 默认图标
 if (typeof window !== "undefined") {
-  const L = require("leaflet");
-  // 通过构建工具解析资源路径
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const iconUrl = require("leaflet/dist/images/marker-icon.png");
-  const iconRetinaUrl = require("leaflet/dist/images/marker-icon-2x.png");
-  const shadowUrl = require("leaflet/dist/images/marker-shadow.png");
-  // @ts-ignore
-  delete L.Icon.Default.prototype._getIconUrl;
-  L.Icon.Default.mergeOptions({ iconRetinaUrl, iconUrl, shadowUrl });
+  (async () => {
+    const { default: L } = await import("leaflet");
+    // @ts-expect-error: Leaflet 类型里没有 _getIconUrl，但运行时确有该私有属性
+    delete L.Icon.Default.prototype._getIconUrl;
+    L.Icon.Default.mergeOptions({
+      iconRetinaUrl,
+      iconUrl,
+      shadowUrl,
+    });
+  })();
 }
+
+
 
 // ✅ 安全壳：避免同一容器被重复初始化（StrictMode / Tab 切换 / HMR）
 // ✅ 改造后的 SafeLeaflet
-function SafeLeaflet({ id = "leaflet-wrapper", mapRef, children, ...rest }: any) {
+type SafeLeafletProps = {
+  id?: string;
+  mapRef: React.MutableRefObject<mp | null>;
+  children: React.ReactNode;
+} & MapContainerProps;
+
+function SafeLeaflet({ id = "leaflet-wrapper", mapRef, children, ...rest }: SafeLeafletProps) {
   const [ready, setReady] = React.useState(false);
   const wrapperRef = React.useRef<HTMLDivElement | null>(null);
   const [containerKey, setContainerKey] = React.useState(() => `${id}-${Date.now()}`);
@@ -1001,42 +1129,35 @@ function SafeLeaflet({ id = "leaflet-wrapper", mapRef, children, ...rest }: any)
     const el = wrapperRef.current;
     if (!el) return;
 
-    // 1) 若已有 map 实例，先彻底销毁
     try { if (mapRef?.current) { mapRef.current.remove(); mapRef.current = null; } } catch {}
 
-    // 2) 清空掉 wrapper 内所有 leaflet 残留
     try {
       const existed = el.querySelectorAll(".leaflet-container");
       existed.forEach(node => node.parentNode && node.parentNode.removeChild(node));
-      // 保险：直接清空子节点
       el.replaceChildren();
     } catch {}
 
-    // 3) 用新的 key 强制下一次渲染创建全新容器
     setContainerKey(`${id}-${performance.now()}`);
-
     const raf = requestAnimationFrame(() => setReady(true));
     return () => cancelAnimationFrame(raf);
-  }, [id]);
+  }, [id, mapRef]);
 
   return (
     <div id={id} ref={wrapperRef} style={{ height: "100%", width: "100%" }}>
       {ready ? (
         <LeafletMap
-          key={containerKey}             // ✅ 每次都用全新容器
-          whenCreated={(map: any) => {
-            // 避免残留引用
-            if (mapRef) {
-              if (mapRef.current && mapRef.current !== map) {
+            key={containerKey}
+            ref={(m: mp | null) => {
+              if (!m) return;
+              if (mapRef.current && mapRef.current !== m) {
                 try { mapRef.current.remove(); } catch {}
               }
-              mapRef.current = map;
-            }
-          }}
-          {...rest}
-        >
-          {children}
-        </LeafletMap>
+              mapRef.current = m;
+            }}
+            {...rest}
+          >
+            {children}
+          </LeafletMap>
       ) : null}
     </div>
   );
@@ -1044,13 +1165,17 @@ function SafeLeaflet({ id = "leaflet-wrapper", mapRef, children, ...rest }: any)
 
 
 
-
 function CoveragePane({ request }: { request: { station_id: string } }) {
   const [loading, setLoading] = useState(false);
-  const [data, setData] = useState<null | { station?: any; radius_m?: number; address?: string }>(null);
+  const [data, setData] = useState<null | {
+    station?: Station;
+    radius_m?: number;
+    address?: string;
+  }>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  const mapRef = React.useRef<any>(null);
+  const mapRef = React.useRef<mp | null>(null);
+
   const Box = UseResizeInvalidate({ mapRef });
 
   // 仅在客户端渲染
@@ -1080,10 +1205,15 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
       const json = await res.json();
       if (!json?.ok) throw new Error(json?.error || "coverage api failed");
       setData(json);
-    } catch (e: any) {
-      setErr(e?.message ?? String(e));
+    } catch (e: unknown) {
+      if (e instanceof Error) {
+        setErr(e.message);
+      } else {
+        setErr(String(e));
+      }
       setData(null);
-    } finally {
+    }
+    finally {
       setLoading(false);
     }
   }, [request?.station_id]);
@@ -1134,8 +1264,11 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
               detectRetina
               eventHandlers={{
                 load: () => {
-                  const m = mapRef.current as any;
-                  if (m && m._mapPane) requestAnimationFrame(() => m.invalidateSize());
+                  const m = mapRef.current;
+                  // `_mapPane` 在类型里不存在，但运行时确实有
+                  if (m && "_mapPane" in m) {
+                    requestAnimationFrame(() => m.invalidateSize());
+                  }
                 },
               }}
             />
@@ -1158,7 +1291,7 @@ export default function AgentWorkbench() {
   const bus = useEventBus();
 
   useEffect(() => {
-    const off = bus.on("chat:ask", (q: any) => {
+    const off = bus.on("chat:ask", (q: unknown) => {
       bus.emit("station:selected", { id: "BTS-001", name: "朝阳-望京2号站", suggest: q });
     });
     return () => off && off();
