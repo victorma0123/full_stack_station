@@ -365,6 +365,12 @@ function ChatPane({ width = 420, height = 720, fill = false }: { width?: number;
             bus.emit("charts:show", { spec: ev.spec, specs: ev.specs, title: ev.title || "AI 生成图表" });
             return;
           }
+          if (ev.type === "tool" && ev.tool === "plotly_batch") {
+            const items = Array.isArray(ev.items) ? ev.items : [];
+            bus.emit("charts:show-batch", { items, title: ev.title || "图表总览" });
+            return;
+          }
+          
           
   
           if (ev.type === "log") {
@@ -502,125 +508,169 @@ function ToolPane() {
   const [activeTab, setActiveTab] = useState("map");
   const [inspecting, setInspecting] = useState(null);
   const [mapQuery, setMapQuery] = useState(null);
-  const [city, setCity] = useState("北京"); // ✅ 新增：当前城市
-  const [logs, setLogs] = useState<Array<{channel:string; message:string; t:number}>>([]);
-  const [coverageReq, setCoverageReq] = useState<{station_id:string} | null>(null); // ✅ 新增
-  const [chartSpec, setChartSpec] = useState<any | null>(null); // ← 新增
+  const [city, setCity] = useState("北京");
+  const [logs, setLogs] = useState<Array<{ channel: string; message: string; t: number }>>([]);
+  const [coverageReq, setCoverageReq] = useState<{ station_id: string } | null>(null);
+  const [chartItems, setChartItems] = useState<Array<{ title: string; spec: any }>>([]);
 
-
+  // 图表区滚动容器，用于切到“图表”时回到顶部
+  const chartsAreaRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    const off1 = bus.on("tool:map:load", (payload: React.SetStateAction<null>) => { setActiveTab("map"); setMapQuery(payload); });
-    const off2 = bus.on("tool:inspect", (data: React.SetStateAction<null>) => { setActiveTab("inspect"); setInspecting(data); });
-    const off3 = bus.on("log:append", (log: { channel: any; message: any; }) => {
+    const off1 = bus.on("tool:map:load", (payload: any) => {
+      setActiveTab("map");
+      setMapQuery(payload);
+    });
+    const off2 = bus.on("tool:inspect", (data: any) => {
+      setActiveTab("inspect");
+      setInspecting(data);
+    });
+    const off3 = bus.on("log:append", (log: { channel: any; message: any }) => {
       setLogs((L) => [...L, { channel: log.channel || "info", message: log.message || String(log), t: Date.now() }]);
     });
-    // ✅ 新增：监听“估算覆盖”
-    const off4 = bus.on("tool:run", (req: { name: string; args: { id: any; }; }) => {
+    const off4 = bus.on("tool:run", (req: { name: string; args: { id: any } }) => {
       if (req?.name === "coverage" && req?.args?.id) {
         setCoverageReq({ station_id: req.args.id });
         setActiveTab("coverage");
       }
     });
     const off5 = bus.on("charts:show", ({ spec, specs, title }) => {
-      setChartSpec(specs ?? spec);
+      const items = Array.isArray(specs)
+        ? specs
+        : spec
+        ? [{ title: title || "AI 生成图表", spec }]
+        : [];
+      setChartItems(items);
       setActiveTab("charts");
     });
-    
-    return () => { off1 && off1(); off2 && off2(); off3 && off3(); off4 && off4(); off5 && off5();
+    const off6 = bus.on("charts:show-batch", ({ items }) => {
+      setChartItems(items);
+      setActiveTab("charts");
+    });
+
+    return () => {
+      off1 && off1();
+      off2 && off2();
+      off3 && off3();
+      off4 && off4();
+      off5 && off5();
+      off6 && off6();
     };
   }, [bus]);
+
+  // 切换到“图表”或图表内容变化时，将滚动置顶
+  useEffect(() => {
+    if (activeTab !== "charts") return;
+    const root = chartsAreaRef.current as HTMLDivElement | null;
+    const viewport = root?.querySelector('[data-radix-scroll-area-viewport]') as HTMLDivElement | null;
+    if (viewport) viewport.scrollTop = 0;
+  }, [activeTab, chartItems]);
 
   return (
     <Card className="h-full w-full rounded-2xl">
       <CardHeader className="p-4">
-        <CardTitle className="flex items-center gap-2 text-base"><Wrench size={18}/> 工具工作台</CardTitle>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Wrench size={18} /> 工具工作台
+        </CardTitle>
       </CardHeader>
       <Separator />
-      <CardContent className="p-0">
-        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full h-full">
-          <div className="px-4 pt-3 flex items-center gap-2">
+      <CardContent className="p-0 h-full flex flex-col min-h-0">
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full h-full flex flex-col">
+          {/* 顶部：固定不压缩 */}
+          <div className="px-4 pt-3 flex items-center gap-2 shrink-0">
             <TabsList>
-              <TabsTrigger value="map" className="gap-1"><Globe2 size={14}/> 地图</TabsTrigger>
+              <TabsTrigger value="map" className="gap-1">
+                <Globe2 size={14} /> 地图
+              </TabsTrigger>
               <TabsTrigger value="inspect">详情</TabsTrigger>
-              <TabsTrigger value="search">检索</TabsTrigger> {/* ✅ 改为 DB 检索 */}
-              <TabsTrigger value="coverage" className="p-4 h-full">覆盖</TabsTrigger> {/* ✅ 新增 */}
+              <TabsTrigger value="search">检索</TabsTrigger>
+              <TabsTrigger value="coverage" className="p-4 h-full">
+                覆盖
+              </TabsTrigger>
               <TabsTrigger value="log">日志</TabsTrigger>
               <TabsTrigger value="charts">图表</TabsTrigger>
-
             </TabsList>
 
-            {/* ✅ 城市选择器（简单版） */}
+            {/* 城市选择器 */}
             <select
               value={city}
-              onChange={(e)=> setCity(e.target.value)}
+              onChange={(e) => setCity(e.target.value)}
               className="ml-auto text-sm border rounded-md px-2 py-1"
               title="切换城市"
             >
-              {["北京","上海","广州","深圳","杭州"].map(c => <option key={c} value={c}>{c}</option>)}
+              {["北京", "上海", "广州", "深圳", "杭州"].map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
             </select>
           </div>
 
-          <TabsContent value="map" className="p-4">
-            <MapPane
-              city={city}                       // ✅ 传 city
-              query={mapQuery}
-              onSelectStation={(s: any)=>{
-                bus.emit("station:selected", s);
-                bus.emit("tool:inspect", s);
-              }}
-            />
-          </TabsContent>
-          <TabsContent value="coverage" className="p-4">
-          {coverageReq ? (
-            <CoveragePane request={coverageReq} />
-          ) : (
-            <Placeholder title="暂无覆盖图" desc="在详情中点击‘估算覆盖’按钮以查看覆盖范围" />
-          )}
-        </TabsContent>
+          {/* 内容容器：占满剩余空间并允许内部滚动 */}
+          <div className="flex-1 min-h-0">
+            <TabsContent value="map" className="h-full p-4">
+              <MapPane
+                city={city}
+                query={mapQuery}
+                onSelectStation={(s: any) => {
+                  bus.emit("station:selected", s);
+                  bus.emit("tool:inspect", s);
+                }}
+              />
+            </TabsContent>
 
-          <TabsContent value="inspect" className="p-4">
-            {inspecting ? <Inspector data={inspecting}/> : <Placeholder title="暂无选中" desc="从地图或检索结果中选择一个基站"/>}
-          </TabsContent>
-
-          <TabsContent value="search" className="p-4">
-            <DbSearchPane
-              
-              onPick={(s)=>{
-                // 点击检索结果 → 进入详情 & 联动聊天
-                bus.emit("tool:inspect", s);
-                bus.emit("station:selected", s);
-                setActiveTab("inspect");
-              }}
-            />
-          </TabsContent>
-
-          <TabsContent value="log" className="p-4">
-            <LogsPane logs={logs} />
-          </TabsContent>
-
-          <TabsContent value="charts" className="p-4">
-            {chartSpec ? (
-              Array.isArray(chartSpec) ? (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {chartSpec.map((it, idx) => (
-                    <div key={idx} className="h-80 md:h-96 border rounded-xl p-2">
-                      <div className="text-sm font-medium mb-2">{it.title}</div>
-                      <PlotlyChart {...it.spec} />
-                    </div>
-                  ))}
-                </div>
+            <TabsContent value="coverage" className="h-full p-4">
+              {coverageReq ? (
+                <CoveragePane request={coverageReq} />
               ) : (
-                <div className="h-80 md:h-96 border rounded-xl p-2">
-                  <PlotlyChart {...chartSpec} />
+                <Placeholder title="暂无覆盖图" desc="在详情中点击‘估算覆盖’按钮以查看覆盖范围" />
+              )}
+            </TabsContent>
+
+            <TabsContent value="inspect" className="h-full p-4">
+              {inspecting ? (
+                <Inspector data={inspecting} />
+              ) : (
+                <Placeholder title="暂无选中" desc="从地图或检索结果中选择一个基站" />
+              )}
+            </TabsContent>
+
+            <TabsContent value="search" className="h-full p-4">
+              <DbSearchPane
+                onPick={(s) => {
+                  bus.emit("tool:inspect", s);
+                  bus.emit("station:selected", s);
+                  setActiveTab("inspect");
+                }}
+              />
+            </TabsContent>
+
+            <TabsContent value="log" className="h-full p-4">
+              <LogsPane logs={logs} />
+            </TabsContent>
+
+            {/* 图表：内部滚动，不撑高外层 */}
+            <TabsContent value="charts" className="h-full p-0">
+              <ScrollArea ref={chartsAreaRef} className="h-full">
+                <div className="p-4">
+                  {chartItems.length > 0 ? (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {chartItems.map((it, idx) => (
+                        <Card key={idx} className="p-3">
+                          <div className="text-sm font-medium mb-2">{it.title}</div>
+                          <div className="h-72 border rounded-xl p-2">
+                            <PlotlyChart {...it.spec} />
+                          </div>
+                        </Card>
+                      ))}
+                    </div>
+                  ) : (
+                    <Placeholder title="暂无图表" desc="在聊天里说：‘北京全部图’ 或 ‘北京饼图’ 等。" />
+                  )}
                 </div>
-              )
-            ) : (
-              <Placeholder title="暂无图表" desc="在聊天中说：‘北京 3D 基站图 / 北京全部图 / 北京厂商水平条形图’ 等" />
-            )}
-          </TabsContent>
-
-
+              </ScrollArea>
+            </TabsContent>
+          </div>
         </Tabs>
       </CardContent>
     </Card>
@@ -1123,7 +1173,7 @@ export default function AgentWorkbench() {
           <div className="h-full min-h-0 flex">
             <ChatPane fill />
           </div>
-          <div className="h-full"><ToolPane/></div>
+          <div className="h-full min-h-0 overflow-hidden"><ToolPane/></div>
         </div>
       </div>
     </BusCtx.Provider>
