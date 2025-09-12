@@ -15,10 +15,9 @@ import { motion } from "framer-motion";
 import remarkGfm from "remark-gfm";
 import type { Map as mp } from "leaflet";
 import type { MapContainerProps } from "react-leaflet";
-import type { Layout, Config, Data } from "plotly.js";
+import type { Layout, Config, Data,PlotlyHTMLElement } from "plotly.js";
 import ReactMarkdown, { type Components } from "react-markdown";
 import "leaflet/dist/leaflet.css";
-
 
 
 
@@ -126,9 +125,60 @@ const mdComponents: Components = {
   li:  (props) => <li className="leading-relaxed" {...props} />,
   a:   (props) => <a {...props} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline" />,
 
-  // 关键：用我们自己的 CodeRenderer，并用 unknown 做类型桥接（不是 any）
   code: CodeRenderer as unknown as Components["code"],
 };
+
+// ====== 放在 ChatBubble 上方或同文件任意位置（组件外也行）======
+function InlineChartTools({
+  title,
+  spec,
+}: {
+  title?: string;
+  spec: PlotlySpec;
+}) {
+  const [gd, setGd] = React.useState<PlotlyHTMLElement | null>(null); 
+
+  const copyJSON = React.useCallback(async () => {
+    await navigator.clipboard.writeText(JSON.stringify(spec, null, 2));
+  }, [spec]);
+
+  const copyCodeBlock = React.useCallback(async () => {
+    const code = "```plotly\n" + JSON.stringify(spec, null, 2) + "\n```";
+    await navigator.clipboard.writeText(code);
+  }, [spec]);
+
+  const downloadPNG = React.useCallback(async () => {
+    try {
+      const Plotly = (window as unknown as { Plotly?: typeof import("plotly.js") }).Plotly;
+      if (!Plotly || !gd) return;
+      const uri = await Plotly.toImage(gd, {
+        format: "png",
+        scale: 2,
+        width: gd.clientWidth,
+        height: gd.clientHeight,
+      });
+      const a = document.createElement("a");
+      a.href = uri;
+      a.download = `${title || "chart"}.png`;
+      a.click();
+    } catch {}
+  }, [gd, title]);
+
+  return (
+    <div className="mt-2 border rounded-xl overflow-hidden">
+      <div className="h-60">
+        {/* 用 onReady 拿到 graphDiv */}
+        <PlotlyChart {...spec} onReady={(div) => setGd(div)} />
+      </div>
+      <div className="flex items-center gap-2 p-2 border-t bg-background/60">
+        <span className="text-xs text-muted-foreground mr-auto">{title || "图表"}</span>
+        <button className="text-xs underline" onClick={copyJSON}>复制 JSON</button>
+        <button className="text-xs underline" onClick={copyCodeBlock}>复制代码块</button>
+        <button className="text-xs underline" onClick={downloadPNG}>下载 PNG</button>
+      </div>
+    </div>
+  );
+}
 
 function ChatBubble({ role, content, meta }: ChatMessage) {
   const isUser = role === "user";
@@ -139,19 +189,22 @@ function ChatBubble({ role, content, meta }: ChatMessage) {
       <motion.div
         initial={{ opacity: 0, y: 6 }}
         animate={{ opacity: 1, y: 0 }}
-        className={`max-w-[85%] rounded-2xl px-4 py-2 shadow-sm text-sm leading-relaxed ${
-          isUser ? "bg-primary text-primary-foreground" : "bg-muted"
-        }`}
+        className={`max-w-[85%] rounded-2xl px-4 py-2 shadow-sm text-sm leading-relaxed border
+          ${isUser ? "bg-primary text-primary-foreground" : "bg-muted text-foreground"}`}
       >
         <div
-          className={`prose prose-sm max-w-none ${
-            isRouter ? "prose-router" : ""
-          }`}
+          className={`prose prose-sm max-w-none ${isRouter ? "prose-router" : ""}`}
+          style={{ color: "inherit" }} // 让 Markdown 继承父级颜色，避免“看不见”
         >
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-          {content}
-        </ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+            {content}
+          </ReactMarkdown>
         </div>
+
+        {/* 内嵌图表 + 工具栏（如后端返回 inline=true） */}
+        {meta?.chart ? (
+          <InlineChartTools title={meta.chartTitle as string} spec={meta.chart} />
+        ) : null}
 
         {meta?.suggest && (
           <div className="mt-2 text-xs opacity-80">💡{meta.suggest}</div>
@@ -160,6 +213,7 @@ function ChatBubble({ role, content, meta }: ChatMessage) {
     </div>
   );
 }
+
 
 
 
@@ -319,12 +373,13 @@ type Station = {
     [key: string]: unknown; // 允许以后加更多字段
   }
   type StreamEvent =
-  | { type: "start" }
-  | { type: "end" }
-  | { type: "token"; delta: string }
-  | { type: "log"; channel?: string; message: string }
-  | { type: "tool"; tool: "plotly"; spec: unknown; specs?: unknown[]; title?: string }
-  | { type: "tool"; tool: "plotly_batch"; items: Array<{ title?: string; spec: unknown }>; title?: string };
+    | { type: "start" }
+    | { type: "end" }
+    | { type: "token"; delta: string }
+    | { type: "log"; channel?: string; message: string }
+    | { type: "tool"; tool: "plotly"; spec: unknown; specs?: unknown[]; title?: string; inline?: boolean } // ← inline 可选
+    | { type: "tool"; tool: "plotly_batch"; items: Array<{ title?: string; spec: unknown }>; title?: string };
+
 
   
   const sendToAgent = useCallback(async (text: string, ctx?: AgentContext) => {
@@ -426,7 +481,27 @@ type Station = {
             return;
           }
           if (ev.type === "tool" && ev.tool === "plotly") {
-            bus.emit("charts:show", { spec: ev.spec, specs: ev.specs, title: ev.title || "AI 生成图表" });
+            if (ev.inline) {
+              // ✅ 直接内嵌到当前助手气泡
+              const i = assistantIndexRef.current;
+              setMessages((m) => {
+                if (i < 0 || i >= m.length) return m;
+                const copy = [...m];
+                const cur = copy[i];
+                copy[i] = {
+                  ...cur,
+                  meta: {
+                    ...(cur.meta || {}),
+                    chart: ev.spec,              // ← 规范
+                    chartTitle: ev.title || "图表",
+                  },
+                };
+                return copy;
+              });
+            } else {
+              // 仍走右侧 Box
+              bus.emit("charts:show", { spec: ev.spec, specs: ev.specs, title: ev.title || "AI 生成图表" });
+            }
             return;
           }
           if (ev.type === "tool" && ev.tool === "plotly_batch") {
@@ -1048,33 +1123,33 @@ const Marker = dynamic(() => import("react-leaflet").then(m => m.Marker), { ssr:
 const Circle = dynamic(() => import("react-leaflet").then(m => m.Circle), { ssr: false });
 const Popup = dynamic(() => import("react-leaflet").then(m => m.Popup), { ssr: false });
 // 替换你当前的 ResizeOnShow 全部实现
-import { useMap } from "react-leaflet";
 
-function ResizeOnShow() {
-  const map = useMap(); // ← 关键：从 context 里拿 map
+// 不依赖 useMap 的版本
+function ResizeOnShowRef({ mapRef }: { mapRef: React.MutableRefObject<mp | null> }) {
   React.useEffect(() => {
+    const map = mapRef.current;
     if (!map) return;
     let alive = true;
+
     const safeInvalidate = () => {
-      // @ts-expect-error _mapPane 是私有字段
-      if (!alive || !map || !map._mapPane) return;
-      try { map.invalidateSize(); } catch {}
+      if (!alive) return;
+      try {
+        map.invalidateSize();
+      } catch {}
     };
-    map.whenReady?.(() => {
+
+    map.whenReady(() => {
       requestAnimationFrame(safeInvalidate);
       requestAnimationFrame(() => requestAnimationFrame(safeInvalidate));
     });
-    const onLoad = () => requestAnimationFrame(safeInvalidate);
-    // @ts-ignore
-    map.on?.("load", onLoad);
+
     return () => {
       alive = false;
-      // @ts-ignore
-      map.off?.("load", onLoad);
     };
-  }, [map]);
+  }, [mapRef]);
   return null;
 }
+
 
 // 放在文件中（与 ResizeOnShow 同级）
 // 1) UseResizeInvalidate：允许 null
@@ -1120,28 +1195,16 @@ function UseResizeInvalidate({ mapRef }: { mapRef: React.MutableRefObject<mp | n
 
 
 // 这些图片用 ESM 导入没问题（不会触发 window）
-import iconUrl from "leaflet/dist/images/marker-icon.png";
-import iconRetinaUrl from "leaflet/dist/images/marker-icon-2x.png";
-import shadowUrl from "leaflet/dist/images/marker-shadow.png";
 
 // 仅在浏览器端初始化 Leaflet 默认图标
 if (typeof window !== "undefined" && process.env.NODE_ENV === "development") {
-  import("leaflet").then(({ default: L }: any) => {
-    if (!L.__patched) {
-      const Orig = L.Map;
-      L.Map = function PatchedMap(this: any, container: any, options: any) {
-        const el = typeof container === "string" ? document.getElementById(container) : container;
-        if (el && (el as any)._leaflet_id) {
-          console.error("[PATCH] Reusing container!", {
-            existed: (el as any)._leaflet_id,
-            newStack: new Error("init stack").stack,
-            el,
-          });
-        }
-        return new Orig(container, options);
-      };
-      L.Map.prototype = Orig.prototype;
-      L.__patched = true;
+  import("leaflet").then((Lmod) => {
+    const desc = Object.getOwnPropertyDescriptor(Lmod, "Map");
+    if (!desc?.writable && !desc?.configurable) {
+      // ESM 导出是只读的，不能改写，直接跳过
+      console.warn("[PATCH] Leaflet ESM export is read-only; skipping Map patch.");
+    } else {
+      // 如果有一天 Leaflet 改了导出方式，这里可以考虑加自定义逻辑
     }
   });
 }
@@ -1150,11 +1213,13 @@ if (typeof window !== "undefined" && process.env.NODE_ENV === "development") {
 
 
 
+
 type SafeLeafletProps = {
-  id: string; // 外层容器 id
+  id: string;
   mapRef: React.MutableRefObject<mp | null>;
   children: React.ReactNode;
-} & Omit<MapContainerProps, "id">;
+  whenCreated?: (m: mp) => void;           // ← 新增
+} & Omit<MapContainerProps, "id" | "ref">; // 避免和我们自定义 ref 冲突
 
 function SafeLeaflet({ id, mapRef, children, ...rest }: SafeLeafletProps) {
   const [ready, setReady] = React.useState(false);
@@ -1175,18 +1240,23 @@ function SafeLeaflet({ id, mapRef, children, ...rest }: SafeLeafletProps) {
 
     // 2) 若页面上已经有同 innerId 的“旧容器”（HMR/StrictMode 很常见），直接“换壳”
     //    —— 用 cloneNode(false) 替换自己，保证新节点绝无 _leaflet_id
-    const stale = document.getElementById(innerId) as any;
+    const stale = document.getElementById(innerId) as (HTMLElement & { _leaflet_id?: number }) | null;
     if (stale) {
       const fresh = stale.cloneNode(false) as HTMLElement;
       // 保险：清掉任何私有标记
-      try { if ((stale as any)._leaflet_id) delete (stale as any)._leaflet_id; } catch {}
+      try { delete (stale as unknown as { _leaflet_id?: number })._leaflet_id; } catch {}
       stale.parentNode?.replaceChild(fresh, stale);
     }
 
     // 3) 清理 wrapper 下面任何历史 .leaflet-container（再保险）
     wrapper.querySelectorAll(".leaflet-container").forEach((el) => {
-      try { if ((el as any)._leaflet_id) delete (el as any)._leaflet_id; } catch {}
-      el.parentNode?.removeChild(el);
+      const node = el as HTMLElement & { _leaflet_id?: number };
+      try {
+        if (node._leaflet_id) {
+          delete node._leaflet_id;
+        }
+      } catch {}
+      node.parentNode?.removeChild(node);
     });
 
     // 4) 触发本次渲染
@@ -1199,12 +1269,21 @@ function SafeLeaflet({ id, mapRef, children, ...rest }: SafeLeafletProps) {
   React.useEffect(() => {
     return () => {
       try {
-        const el = document.getElementById(innerId) as any;
-        if (el && el._leaflet_id) delete el._leaflet_id;
+        const el = document.getElementById(innerId) as (HTMLElement & { _leaflet_id?: number }) | null;
+        if (el && el._leaflet_id) {
+          delete el._leaflet_id;
+        }
       } catch {}
-      try { if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } } catch {}
+  
+      try {
+        if (mapRef.current) {
+          mapRef.current.remove();
+          mapRef.current = null;
+        }
+      } catch {}
     };
   }, [innerId, mapRef]);
+  
 
   return (
     <div id={id} ref={wrapperRef} data-safe-leaflet="1" style={{ height: "100%", width: "100%" }}>
@@ -1262,9 +1341,11 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
 
   // 创建时记录自己的 _leaflet_id，后续卸载只移除“自己”的实例
   const onCreated = useCallback((m: mp) => {
+    interface PatchedMap extends mp {
+      _leaflet_id?: number;
+    }
     mapRef.current = m;
-    // @ts-ignore
-    selfIdRef.current = (m as any)._leaflet_id;
+    selfIdRef.current = (m as PatchedMap)._leaflet_id;
 
     // 初次就绪后再做一次尺寸校准
     try {
@@ -1276,9 +1357,9 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
   // 卸载时清理：仅当容器仍属于“自己”时才 remove，避免与新实例抢容器
   useEffect(() => {
     return () => {
-      const m = mapRef.current as any;
+      const m = mapRef.current;
       if (!m) return;
-      const el: any = m.getContainer?.() || m._container;
+      const el = (m.getContainer?.() ?? (m as unknown as { _container?: HTMLElement })._container) as (HTMLElement & { _leaflet_id?: number }) | undefined;
   
       try { m.remove?.(); } catch {}
       mapRef.current = null;
@@ -1289,10 +1370,12 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
       }
   
       try {
-        const node = document.getElementById(containerId) as any;
-        if (node && (!node.querySelector(".leaflet-container"))) {
+        const node = document.getElementById(containerId) as (HTMLElement & { _leaflet_id?: number }) | null;
+        if (node && !node.querySelector(".leaflet-container")) {
           node.replaceChildren();
-          if (node._leaflet_id) delete node._leaflet_id; // 再兜底删一次
+          if (node._leaflet_id) {
+            delete node._leaflet_id; // 再兜底删一次
+          }
         }
       } catch {}
     };
@@ -1362,14 +1445,32 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
               detectRetina
               eventHandlers={{
                 load: () => {
-                  const m = mapRef.current as any;
-                  if (m && (m._mapPane || m.getContainer)) {
-                    requestAnimationFrame(() => { try { m.invalidateSize?.(); } catch {} });
+                  const m = mapRef.current;
+                  if (!m) return;
+              
+                  // 访问私有 _mapPane 需要临时扩展类型
+                  const hasPane =
+                    (m as unknown as { _mapPane?: HTMLElement })._mapPane != null;
+              
+                  // 调用 getContainer()，若抛错也无所谓；返回 HTMLElement 则为真
+                  let hasContainer = false;
+                  try {
+                    hasContainer = typeof m.getContainer === "function" && !!m.getContainer();
+                  } catch {
+                    hasContainer = false;
+                  }
+              
+                  if (hasPane || hasContainer) {
+                    requestAnimationFrame(() => {
+                      try { m.invalidateSize?.(); } catch {}
+                    });
                   }
                 },
               }}
+              
+              
             />
-            <ResizeOnShow />
+            <ResizeOnShowRef mapRef={mapRef} />
             <Marker position={[lat, lng]} />
             {radius > 0 && <Circle center={[lat, lng]} radius={radius} />}
           </SafeLeaflet>

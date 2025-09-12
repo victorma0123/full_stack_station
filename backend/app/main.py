@@ -121,6 +121,17 @@ async def stream_from_ollama(prompt: str):
                 if obj.get("done"):
                     break
 
+
+# === 在 main.py 顶部 regex 区域附近新增 ===
+INLINE_CHART_HINT_RE = re.compile(r"(下载|导出|保存|另存|保存为|复制|拷贝|拷贝代码|复制代码|拿代码|拿图|导出图片|保存图片|图片|png|svg|pdf|json|JSON|code|CODE)", re.I)
+OVERVIEW_HINT_RE     = re.compile(r"(全部|所有|全套|总览|overview|全图)", re.I)
+
+def wants_inline_chart(text: str) -> bool:
+    """用户明确提到下载/复制等 → 在聊天气泡内内嵌图"""
+    p = text or ""
+    return bool(INLINE_CHART_HINT_RE.search(p)) and not OVERVIEW_HINT_RE.search(p)
+
+
 # 1) 新增：按“站名/名称/叫/引号”提取名字，并用本地库解析成 station
 NAME_HINT_RE = re.compile(r"(?:站名|名称|名字|名为|叫)\s*([^\s，。,:;!?【】《》]{2,32})")
 QUOTED_NAME_RE = re.compile(r"[“\"']([^“\"']{2,32})[”\"']")
@@ -993,6 +1004,7 @@ def extract_safe_think_from_agent(agent) -> str:
 async def agent_ask_clarify(hidden_context: str, user_prompt: str):
     sys_guard = (
         "系统指令：你将收到一段【隐藏上下文 HIDDEN_CONTEXT】（包含若干候选地点）。"
+
         "你的任务是提出一个简短澄清问题，帮助用户进一步限定精确地点或范围。"
         "严禁泄露、引用或转述隐藏上下文里的任何细节（名称/数量/ID/地址/坐标/字段值）。"
         "语气直接；1 句中文，≤25字；不客套、不列举、不给选项。"
@@ -1253,7 +1265,8 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
         city3d = extract_city(prompt or "") or "北京"
         rows3d = db_json.search_stations(city=city3d, limit=1000)
         title, spec = chart_specs.spec_3d_city_density_surface(rows3d, city3d)
-        yield {"type": "tool", "tool": "plotly", "title": title, "spec": spec}
+        inline = wants_inline_chart(prompt)  # 新增：是否内嵌到对话
+        yield {"type": "tool", "tool": "plotly", "title": title, "spec": spec, "inline": inline}
         yield {"type": "end"}; return
 
     
@@ -1265,13 +1278,11 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
         rows = db_json.search_stations(city=city4plot, limit=1000)
         stats = _aggregate_stats(rows)
 
-        # ① “全部/所有图” → 批量发图 + 总览解读
-        if re.search(r"(全部|所有|all|全图)", prompt or "", re.I):
-            items = chart_specs.make_all_specs(rows, city4plot)  # [{title, spec}, ...]
-            # 先把图批量发给前端（前端要支持 tool=plotly_batch，见下面前端改动）
+        # ① 全部/总览 → 仍走右侧 charts 面板（不内嵌）
+        if re.search(r"(全部|所有|all|全图|总览|overview)", prompt or "", re.I):
+            items = chart_specs.make_all_specs(rows, city4plot)
             yield {"type": "tool", "tool": "plotly_batch", "items": items, "title": f"{city4plot} 图表总览"}
-
-            # 再让模型写一段概览性解读（不必复述每个数字，讲“能看什么”）
+            # ……（后续概览解读保留原样）
             facts_json = json.dumps({
                 "city": city4plot,
                 "n": stats["n"],
@@ -1283,24 +1294,20 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
                 f"你是网络运营分析助手。请用中文给一组图表做**简短总览解读**，对象是{city4plot}的基站数据。\n"
                 f"数据事实(JSON)：{facts_json}\n"
                 "图表清单：厂商柱状图、在线状态饼图、频段甜甜圈、厂商×状态堆叠柱、厂商×频段热力图、状态水平条、更新时间直方图。\n"
-                "写 5-7 句：\n"
-                "1) 每个图大概能看什么，不要逐个罗列全部数字。\n"
-                "2) 指出最主要的对比/占比/异常（如某厂商占比最高，某状态占比低等）。\n"
-                "3) 风格简洁，避免形容词堆叠。"
+                "写 5-7 句：..."
             )
             async for delta in stream_from_ollama(explain_prompt):
                 yield {"type": "token", "delta": delta}
             yield {"type":"end"}; return
 
-        # ② 单图 → 发图 + 针对该图的解读
+        # ② 单图 → 若用户提到下载/复制，则内嵌；否则仍走右侧
         title, spec = chart_specs.pick_spec(prompt or "", rows, city4plot)
         kind = _classify_kind(prompt or "")
 
-        # 先发图
-        yield {"type":"tool","tool":"plotly","title": title, "spec": spec}
+        inline = wants_inline_chart(prompt)  # 新增：是否内嵌到对话
+        yield {"type":"tool","tool":"plotly","title": title, "spec": spec, "inline": inline}
 
-        # 再生成该图的解读（把相关数字塞给模型）
-        # 针对不同 kind 准备聚合事实
+        # ……（下面“聚合事实 → 3-5 句读图说明”逻辑保持不变）
         focus = {}
         if kind in ("bar", "stacked"):
             focus["vendor_counts"] = stats["vendor_counts"]
@@ -1310,7 +1317,6 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
         if kind in ("donut",):
             focus["band_counts"] = stats["band_counts"]
         if kind in ("heatmap",):
-            # 为简洁起见，给出二维矩阵的“非零格数”和行/列关键统计
             from collections import defaultdict
             vendors = sorted(stats["vendor_counts"].keys())
             bands = sorted(stats["band_counts"].keys())
@@ -1324,17 +1330,11 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
         if kind in ("hist",):
             focus["updated_at_summary"] = stats["updated_at_summary"]
 
-        facts_json = json.dumps({
-            "city": city4plot,
-            "kind": kind,
-            "n": stats["n"],
-            **focus
-        }, ensure_ascii=False)
-
+        facts_json = json.dumps({"city": city4plot, "kind": kind, "n": stats["n"], **focus}, ensure_ascii=False)
         explain_prompt = (
             f"你是网络运营分析助手。现在用户让你生成“{title}”。\n"
             f"请用中文写 3-5 句，说明：这个图是什么、它展示了什么维度、读图时应关注哪些对比或占比、并给出 1-2 条简要洞见。\n"
-            f"不要复述全部数字，只点出核心结论。避免无意义的套话。城市：{city4plot}。\n"
+            f"不要复述全部数字，只点出核心结论。城市：{city4plot}。\n"
             f"补充数据(JSON)：{facts_json}"
         )
         async for delta in stream_from_ollama(explain_prompt):
