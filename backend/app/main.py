@@ -11,11 +11,15 @@ from app import db_json
 from pydantic import BaseModel
 from typing import Optional
 import anyio
-from fastapi import Request
 import base64
 import httpx
 import asyncio
 from collections import Counter
+from .mock_geo import BASE as POI_SEED
+from . import pois_json
+import time
+
+
 
 
 #from app import rag_store
@@ -26,6 +30,7 @@ from strands.agent.conversation_manager import SlidingWindowConversationManager
 from strands.models.ollama import OllamaModel
 import hashlib
 from math import isnan
+
 
 # === 图表解读小工具 ===
 def _aggregate_stats(rows: list[dict]) -> dict:
@@ -195,7 +200,178 @@ def extract_city_status_count(prompt: str):
         return None
     return city, status
 
+# ===== POI + 附近检索：工具函数（最小版） =====
+
+# 替换原 NEAR_WORDS_RE，并新增基站词
+NEAR_WORDS_RE = re.compile(r"(附近|周边|周围|邻近|就近|周遭|一?公里内|方圆|范围内|近处|近邻|近旁)", re.I)
+BS_WORDS_RE   = re.compile(r"(基站|站点|5g|4g|小区|宏站|微站|室分)", re.I)
+
+# 可选：用于避免把道路/行政区当成 POI
+ROAD_SUFFIX_RE   = re.compile(r"(路|街|巷|大道|环路|高速|省道|国道|线|号线)$")
+ADMIN_SUFFIX_RE  = re.compile(r"(市|区|县)$")
+POI_SUFFIX       = r"(中心|广场|商圈|医院|车站|公园|体育场|体育馆|步行街|机场|大厦|园区|科技园|园|市场|码头|港|会展中心|博物馆|美术馆|图书馆|大学|学院|来福士|万象城|太古里|万达广场)"
+LOOSE_POI_BEFORE_NEAR = re.compile(r"([\u4e00-\u9fffA-Za-z0-9·]{2,24})(?=(?:的)?(?:一?公里内|方圆|范围内)?(?:附近|周边|周围))")
+LOOSE_POI_BEFORE_BS   = re.compile(r"([\u4e00-\u9fffA-Za-z0-9·]{2,24})(?=(?:的)?(?:基站|站点|5G|4G|小区))", re.I)
+
+def extract_poi_key(prompt: str) -> str | None:
+    """严格规则 + 松弛兜底：提到 POI 且结合“附近/基站”时返回 POI 名；城市/道路/行政区会被过滤掉。"""
+    if not prompt:
+        return None
+
+    def _valid(cand: str) -> bool:
+        cand = cand.strip()
+        if not cand or len(cand) < 2:
+            return False
+        if cand in CITY_NAMES:
+            return False
+        if ADMIN_SUFFIX_RE.search(cand):
+            return False
+        if ROAD_SUFFIX_RE.search(cand):
+            return False
+        if BS_WORDS_RE.search(cand):  # “基站/5G”不是 POI 名
+            return False
+        return True
+
+    # —— 严格：引号优先 —— 
+    m = re.search(r"[“\"']([^“\"']{2,24})[”\"']", prompt)
+    if m:
+        cand = m.group(1).strip()
+        for cname in CITY_NAMES:
+            cand = cand.replace(cname, "")
+        cand = cand.strip()
+        return cand if _valid(cand) else None
+
+    # —— 严格：常见 POI 后缀 —— 
+    m = re.search(rf"([\u4e00-\u9fffA-Za-z0-9·]{2,24}){POI_SUFFIX}", prompt)
+    if m:
+        cand = m.group(0)
+        for cname in CITY_NAMES:
+            cand = cand.replace(cname, "")
+        cand = cand.strip()
+        if _valid(cand):
+            return cand
+
+    # —— 松弛兜底：如果句子里出现“附近/基站”，抓其前面的短词当 POI —— 
+    if NEAR_WORDS_RE.search(prompt) or BS_WORDS_RE.search(prompt):
+        for pat in (LOOSE_POI_BEFORE_NEAR, LOOSE_POI_BEFORE_BS):
+            m = pat.search(prompt)
+            if m:
+                cand = m.group(1).strip()
+                for cname in CITY_NAMES:
+                    cand = cand.replace(cname, "")
+                cand = cand.strip()
+                if _valid(cand):
+                    return cand
+
+    return None
+
+def find_poi_candidates(prompt: str):
+    """只用 POI 关键词召回；city 仅作过滤，不再把 city 拼进关键字。"""
+    city_hint = extract_city(prompt or "")
+    key = extract_poi_key(prompt or "")
+    if not key:
+        return [], city_hint
+    for cname in CITY_NAMES:
+        key = key.replace(cname, "")
+    key = key.strip()
+    if not key:
+        return [], city_hint
+    cands = pois_json.search_pois(city=city_hint, name_like=key, limit=12)
+    if not cands:
+        cands = pois_json.search_pois(name_like=key, limit=12)
+    return cands, city_hint
+
+
+def _haversine_m(lat1, lon1, lat2, lon2) -> float:
+    """球面距离（米）"""
+    from math import radians, sin, cos, sqrt, atan2
+    R = 6371000.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return R * c
+
+def nearby_stations_by_poi(poi: dict, radius_m: int | None = None, limit: int = 200) -> list[dict]:
+    """在 POI 周边按半径筛基站（简单遍历，demo 足够）。"""
+    lat0, lng0 = float(poi.get("lat")), float(poi.get("lng"))
+    #r = int(radius_m or poi.get("radius_m") or 2000)
+    r = 5000
+    items = db_json.load_all()
+    hits = []
+    for s in items:
+        if poi.get("city") and s.get("city") != poi.get("city"):
+            continue  # 同城优先，避免跨城噪声
+        lat, lng = s.get("lat"), s.get("lng")
+        if lat is None or lng is None:
+            continue
+        d = _haversine_m(lat0, lng0, float(lat), float(lng))
+        if d <= r:
+            ss = dict(s)
+            ss["_dist_m"] = int(d)
+            hits.append(ss)
+    hits.sort(key=lambda x: x["_dist_m"])
+    return hits[:limit]
+
+
 # --- 轻规则 & Markdown 工具 ---
+# ====== POI 消歧：短期记忆 & 口令解析（Demo 级，单进程有效） ======
+LAST_POI_STATE = {
+    "candidates": [],     # 上次产生的候选（多选时）
+    "selected": None,     # 已选中的 POI（唯一或用户选择）
+    "city_hint": None,
+    "created_at": 0.0,
+}
+
+CN_NUM = {"一":1,"二":2,"两":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9,"十":10}
+CHOICE_IDX_RE    = re.compile(r"(?:选|选择|要|就|第)?\s*(\d{1,2}|[一二两三四五六七八九十]{1,3})\s*(?:个|号|家)?")
+CHOICE_ID_RE     = re.compile(r"\bPOI-[A-Z]{2}-\d{4}\b", re.I)
+CITY_HINT_RE     = re.compile(r"(北京|上海|广州|深圳|杭州)")
+DISTRICT_HINT_RE = re.compile(r"(朝阳|海淀|东城|西城|石景山|黄浦|浦东|闵行|越秀|番禺|龙华|龙岗|滨江)")
+RADIUS_RE        = re.compile(r"(?:(?:半径|范围|圈|距离|附近|周边).{0,4})?(\d+(?:\.\d+)?)\s*(米|m|公里|千米|km)", re.I)
+TOPK_RE          = re.compile(r"(?:最近|前|取)\s*(\d{1,2})\s*(?:个|站)?")
+
+def _cn_to_int(tok: str) -> int | None:
+    tok = tok.strip()
+    if tok.isdigit(): return int(tok)
+    if tok in CN_NUM: return CN_NUM[tok]
+    if len(tok)==2 and tok[0]=="十" and tok[1] in CN_NUM: return 10 + CN_NUM[tok[1]]
+    if len(tok)==2 and tok[0] in CN_NUM and tok[1]=="十": return CN_NUM[tok[0]] * 10
+    if len(tok)==3 and tok[1]=="十": return CN_NUM.get(tok[0],0)*10 + CN_NUM.get(tok[2],0)
+    return None
+
+def parse_choice_index(text: str) -> int | str | None:
+    m_id = CHOICE_ID_RE.search(text or "")
+    if m_id: return m_id.group(0)  # 直接返回 POI-ID 字符串
+    m = CHOICE_IDX_RE.search(text or "")
+    if not m: return None
+    raw = m.group(1)
+    if raw.isdigit(): return int(raw)
+    return _cn_to_int(raw)
+
+def parse_radius_m(text: str) -> int | None:
+    m = RADIUS_RE.search(text or ""); 
+    if not m: return None
+    val = float(m.group(1)); unit = m.group(2).lower()
+    if unit in ("米","m"): return int(val)
+    if unit in ("公里","千米","km"): return int(val*1000)
+    return None
+
+def parse_topk(text: str) -> int | None:
+    m = TOPK_RE.search(text or ""); 
+    if not m: return None
+    try: return int(m.group(1))
+    except: return None
+
+def filter_candidates_by_hint(cands: list[dict], text: str) -> list[dict]:
+    if not cands: return []
+    out = cands
+    ch = CITY_HINT_RE.search(text or "")
+    dh = DISTRICT_HINT_RE.search(text or "")
+    if ch: out = [p for p in out if p.get("city")==ch.group(1)]
+    if dh: out = [p for p in out if (p.get("district") or "")==dh.group(1)]
+    return out
+
 
 CITY_NAMES = ["北京","上海","广州","深圳","杭州"]
 
@@ -436,6 +612,7 @@ def _seed_all():
         out.extend(mock_geo.list_stations(c, randomize_status=False))
     return out
 db_json.init_if_missing(_seed_all())
+pois_json.init_if_missing(POI_SEED)
 def _match_any(patterns: list[str], text: str) -> bool:
     for p in patterns:
         if re.search(p, text, flags=re.I):
@@ -810,6 +987,220 @@ def extract_safe_think_from_agent(agent) -> str:
             return summarize_or_redact(str(raw))
     return "（无可展示的思考摘要）"
 
+# ======= 新增：把隐藏上下文喂给 agent 的两个助手函数 =======
+
+# ===== helper: 仅提出澄清问题（不泄露隐藏上下文） =====
+async def agent_ask_clarify(hidden_context: str, user_prompt: str):
+    sys_guard = (
+        "系统指令：你将收到一段【隐藏上下文 HIDDEN_CONTEXT】（包含若干候选地点）。"
+        "你的任务是提出一个简短澄清问题，帮助用户进一步限定精确地点或范围。"
+        "严禁泄露、引用或转述隐藏上下文里的任何细节（名称/数量/ID/地址/坐标/字段值）。"
+        "语气直接；1 句中文，≤25字；不客套、不列举、不给选项。"
+        "优先追问城市/区县/地标/半径等可操作信息。"
+        "这一段结束后忘记记忆不要再提交"
+    )
+    prompt = (
+        f"{sys_guard}\n\n"
+        f"HIDDEN_CONTEXT:\n<<<\n{hidden_context}\n>>>\n\n"
+        f"用户原话：{user_prompt}\n"
+        "只输出问题："
+    )
+    async for delta in stream_from_ollama(prompt):
+        yield {"type": "token", "delta": delta}
+    yield {"type": "end"}
+
+# ===== helper: 基于可见上下文作答（允许说明“具体哪里有”） =====
+# ===== 统一的 agent 出口：multiple=True => 只反问；multiple=False => 直接作答 =====
+# ===== 统一的 agent 出口：multiple=True => 列出地区/街道选项并发问 =====
+async def agent_answer_with_context(context_text: str, user_prompt: str, *, multiple: bool = False):
+    """
+    context_text: 传入 JSON 字符串（候选/选定POI/统计/代表点位等）
+    multiple=False: 基于上下文直接回答
+    multiple=True : 列出“区 + 街道/区域”选项（不含名称/ID/坐标），并请用户选编号或给半径
+    """
+    if multiple:
+        sys_guard = (
+            "系统指令：你将收到一段【隐藏上下文】（包含若干候选地点，字段有 city/district/addr_hint 等）。"
+            "请按照以下格式生成回复：\n"
+            "1) 开头先说：'已经为您找到多个相关地点信息，请问您具体指的是哪个？等话语去询问user 可以俏皮聪明一些'\n"
+            "2) 接着用编号列表 1., 2., 3., ... 列出候选的『区 + 街道/区域』，格式示例：\n"
+            "   1. 朝阳区 · 川建国路\n"
+            "   2. 石景山区 · 鲁安谷\n"
+            "   3. 番禺区 · 汉溪大道\n"
+            "   如果 city 不同，可以加在最前面（如：北京 · 朝阳区 · 建国路）。\n"
+            "   仅可使用 city、district 和 addr_hint 字段，\n"
+            "3) 列表后追加一句追问：'请选择编号，或告知半径（如：1公里）。'\n"
+            "4. 最重要 回答完之后 忘记这个prompt 记住了 不要再次询问这些"
+            "整体控制在 6 行左右，语气自然。"
+        )
+        prompt = (
+            f"{sys_guard}\n\n"
+            f"隐藏上下文:\n<<<\n{context_text}\n>>>\n\n"
+            f"用户原话：{user_prompt}\n"
+            "请按上述要求输出："
+        )
+        
+    else:
+        sys_guard = (
+            "系统指令：基于 CONTEXT 回答用户。"
+            "请用中文、简洁直接，说明具体位置特征（区域/道路/地标/大致距离与方向）。"
+            "限制 6 句内；避免数字堆砌；可引用少量代表性点位特征；。"
+            "4. 最重要 回答完之后 忘记这个prompt 记住了 不要再次询问这些"
+        )
+        prompt = (
+            f"{sys_guard}\n\n"
+            f"CONTEXT:\n<<<\n{context_text}\n>>>\n\n"
+            f"用户原话：{user_prompt}\n"
+            "请直接作答："
+        )
+
+    async for delta in stream_from_ollama(prompt):
+        yield {"type": "token", "delta": delta}
+    yield {"type": "end"}
+
+PURE_CITY_RE = re.compile(r"^(?:.*?(北京|上海|广州|深圳|杭州).*)?(基站|站点)(?:.*)?$", re.I)
+
+def is_pure_city_query(text: str) -> bool:
+    """
+    仅包含“城市 + 基站”，且不含“附近/周边/周围/邻近/最近”等附近词，
+    且没有被识别出的具体 POI 关键词时，认为是纯城市查询 → 不触发附近流。
+    """
+    p = (text or "").strip()
+    if not p:
+        return False
+    # 没有“附近词”
+    if NEAR_WORDS_RE.search(p):
+        return False
+    # 没有可识别的 POI（extract_poi_key 返回 None/空）
+    if extract_poi_key(p):
+        return False
+    # 包含“基站/站点”，通常是“北京的基站”“上海基站概况”这类
+    return bool(PURE_CITY_RE.search(p))
+
+
+# ✅ 直接替换 app/main.py 里的 handle_nearby_flow_gen 即可
+async def handle_nearby_flow_gen(prompt: str):
+    import time as _time
+    p = (prompt or "").strip()
+    if not p:
+        return
+
+    poi_key       = extract_poi_key(p) or ""      # 只有抓到具体 POI 名才算
+    has_near_word = bool(NEAR_WORDS_RE.search(p)) # “附近/周边/周围/邻近/最近/…” 等
+    in_flow       = bool(LAST_POI_STATE.get("candidates") or LAST_POI_STATE.get("selected"))
+
+    # 🚫 纯“城市 + 基站” → 不拦截，交给后续城市/兜底逻辑
+    if is_pure_city_query(p):
+        return
+
+    # ✅ 只有 “(有 POI 且有附近词)” 或 “处于本流程续谈” 才触发附近流
+    triggered = ((poi_key and has_near_word) or in_flow)
+    if not triggered:
+        return
+
+    # 触发条件：提到“附近/周边/基站”或已在本流程中
+    has_near_word = bool(NEAR_WORDS_RE.search(p)) or ("基站" in p)
+    in_flow = bool(LAST_POI_STATE.get("candidates") or LAST_POI_STATE.get("selected"))
+    if not (has_near_word or in_flow or extract_poi_key(p)):
+        return  # 不处理，交回上游
+
+    # ---- 如果处于“待选”阶段，尝试用用户补充来收敛 ----
+    if LAST_POI_STATE.get("candidates"):
+        cands = LAST_POI_STATE["candidates"]
+        # 1) 直接编号或ID选择
+        idx_or_id = parse_choice_index(p)
+        chosen = None
+        if isinstance(idx_or_id, str) and idx_or_id.upper().startswith("POI-"):
+            chosen = next((x for x in cands if x.get("id") == idx_or_id), None)
+        elif isinstance(idx_or_id, int) and 1 <= idx_or_id <= len(cands):
+            chosen = cands[idx_or_id - 1]
+        # 2) 城市/区县等提示再过滤
+        narrowed = filter_candidates_by_hint(cands, p) if not chosen else [chosen]
+        if len(narrowed) == 1:
+            poi = narrowed[0]
+            LAST_POI_STATE.update({"selected": poi, "candidates": [], "city_hint": poi.get("city"), "created_at": _time.time()})
+            # 直接查附近并作答（默认半径：1000m，可被 parse_radius_m 覆盖）
+            radius = parse_radius_m(p) or int(poi.get("radius_m") or 1000)
+            hits = nearby_stations_by_poi(poi, radius_m=radius)
+            ctx = {
+                "poi": {
+                    "id": poi.get("id"), "name": poi.get("name"),
+                    "city": poi.get("city"), "district": poi.get("district"),
+                    "addr_hint": poi.get("addr_hint"), "lat": poi.get("lat"), "lng": poi.get("lng"),
+                    "radius_m": radius
+                },
+                "summary": _aggregate_stats(hits),
+                "representatives": [
+                    {k: r.get(k) for k in ("id","name","vendor","band","status","_dist_m","lat","lng")}
+                    for r in hits[:8]
+                ]
+            }
+            visible_ctx = json.dumps(ctx, ensure_ascii=False)
+            async for ev in agent_answer_with_context(visible_ctx, p, multiple=False):
+                yield ev
+            return
+        else:
+            # 仍不唯一 → 继续请 agent 追问（不回显清单）
+            hidden_ctx = json.dumps({"candidates": [
+                {
+                    "id": x.get("id"), "name": x.get("name"),
+                    "city": x.get("city"), "district": x.get("district"),
+                    "addr_hint": x.get("addr_hint")
+                } for x in cands
+            ]}, ensure_ascii=False)
+            async for ev in agent_answer_with_context(hidden_ctx, p, multiple=True):
+                yield ev
+            return
+
+    # ---- 首问：召回候选（不回显清单）----
+    poi_key = extract_poi_key(p) or ""
+    cands, city_hint = find_poi_candidates(p)
+    if not cands:
+        # 让 agent 追问更具体信息（城市/地标/范围）
+        hidden_ctx = json.dumps({"reason": "not_found", "hint_needed": ["城市/区县","更具体地标","半径"]}, ensure_ascii=False)
+        async for ev in agent_answer_with_context(hidden_ctx, p, multiple=True):
+            yield ev
+        return
+
+    # 收敛（城市/区县等提示）
+    narrowed = filter_candidates_by_hint(cands, p) if cands else []
+    if len(narrowed) == 1:
+        poi = narrowed[0]
+        LAST_POI_STATE.update({"selected": poi, "candidates": [], "city_hint": city_hint or poi.get("city"), "created_at": _time.time()})
+        radius = parse_radius_m(p) or int(poi.get("radius_m") or 1000)
+        hits = nearby_stations_by_poi(poi, radius_m=radius)
+        ctx = {
+            "poi": {
+                "id": poi.get("id"), "name": poi.get("name"),
+                "city": poi.get("city"), "district": poi.get("district"),
+                "addr_hint": poi.get("addr_hint"), "lat": poi.get("lat"), "lng": poi.get("lng"),
+                "radius_m": radius
+            },
+            "summary": _aggregate_stats(hits),
+            "representatives": [
+                {k: r.get(k) for k in ("id","name","vendor","band","status","_dist_m","lat","lng")}
+                for r in hits[:8]
+            ]
+        }
+        visible_ctx = json.dumps(ctx, ensure_ascii=False)
+        async for ev in agent_answer_with_context(visible_ctx, p, multiple=False):
+            yield ev
+        return
+
+    # 多个候选：进入“待选”状态，但不回显；让 agent 只提出一个澄清问题
+    LAST_POI_STATE.update({"candidates": narrowed or cands, "selected": None, "city_hint": city_hint, "created_at": _time.time()})
+    hidden_ctx = json.dumps({"candidates": [
+        {
+            "id": x.get("id"), "name": x.get("name"),
+            "city": x.get("city"), "district": x.get("district"),
+            "addr_hint": x.get("addr_hint")
+        } for x in (narrowed or cands)
+    ]}, ensure_ascii=False)
+    async for ev in agent_answer_with_context(hidden_ctx, p, multiple=True):
+        yield ev
+    return
+
+
 async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] | None = None):
     #yield {"type": "start"}
 
@@ -817,6 +1208,9 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
     
     # 1️⃣ 默认从 context 取
     station = (context or {}).get("station") if isinstance(context, dict) else None
+         # —— 优先尝试“附近 + POI 消歧”流 —— 
+
+
 
     # 2️⃣ 如果 context 里没有，或者可能是旧的，就尝试从对话历史里找“已选中基站”
     #    注意：这里会覆盖掉 context.station，确保拿到最新的一次
@@ -841,7 +1235,7 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
 
     # 然后走 try_direct_answer（问“它的id/坐标/状态/详情”等都会直答，不进模型）
 
-    
+
     cs = extract_city_status_count(prompt)
     if cs:
         city, status = cs
@@ -853,6 +1247,7 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
         yield {"type": "end"}
         return
         
+
 # ✅ 3D 意图优先匹配（放在城市清单直答之前）
     if re.search(r"(3d|三维|立体|体渲染|体积|等值面|等高|模拟)", prompt or "", re.I):
         city3d = extract_city(prompt or "") or "北京"
@@ -988,6 +1383,7 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
         "1) 若用户已选中基站，则优先回答该基站的具体信息；\n"
         "2) 若用户问到某个城市的所有基站，则列出该城市的基站清单（可以用 Markdown 表格展示）；\n"
         "3) 若资料有冲突，以当前选中基站的信息为准。\n"
+        
     )
 
     aug_prompt = (
@@ -997,6 +1393,12 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
     )
 
 
+    handled = False
+    async for ev in handle_nearby_flow_gen(prompt):
+        handled = True
+        yield ev
+    if handled:
+        return
    
 # ★ 3) 模型兜底：仅给 Top-K 精简表做检索增强，避免全量 JSON
     topk = topk_context_for_prompt(prompt, k=12)
@@ -1041,3 +1443,60 @@ def chat_once(payload: Dict[str, Any] = Body(...)):
         return {"ok": True, "text": str(text)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    
+@app.get("/api/geo/nearby")
+def geo_nearby(
+    q: Optional[str] = None,
+    poi_id: Optional[str] = None,
+    city: Optional[str] = None,
+    radius_m: int = Query(2000, ge=100, le=20000),
+    limit: int = Query(200, ge=1, le=2000),
+):
+    """
+    通用“POI 附近基站”接口（无需前端改造即可测试）：
+    - 传 poi_id：直查附近
+    - 传 q（可配 city）：做 POI 消歧；0/1/>1 分别返回 none/single/multi 三种形态
+    返回字段：
+      mode: "none" | "single" | "multi"
+      candidates: [...]   # 当 mode=multi
+      poi + matches: [...]# 当 mode=single
+    """
+    # 直查（poi_id 优先）
+    if poi_id:
+        poi = pois_json.get_poi(poi_id)
+        if not poi:
+            return {"ok": False, "error": "poi not found"}
+        matches = nearby_stations_by_poi(poi, radius_m=radius_m, limit=limit)
+        return {"ok": True, "mode": "single", "poi": poi, "matches": matches}
+
+    # 文本查询（带消歧）
+    if not q and not city:
+        return {"ok": False, "error": "need q or poi_id"}
+    prompt = (q or "").strip()
+    cands, _ = find_poi_candidates(prompt)
+    if city:
+        cands = [p for p in cands if p.get("city") == city]
+    if not cands:
+        return {"ok": True, "mode": "none", "candidates": []}
+
+    if len(cands) == 1:
+        poi = cands[0]
+        matches = nearby_stations_by_poi(poi, radius_m=radius_m, limit=limit)
+        return {"ok": True, "mode": "single", "poi": poi, "matches": matches}
+
+    # 多候选：只返回“候选列表”（供你人工/后续再选）
+    candidates = [
+        {
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "city": p.get("city"),
+            "district": p.get("district"),
+            "addr_hint": p.get("addr_hint"),
+            "lat": p.get("lat"),
+            "lng": p.get("lng"),
+            "category": p.get("category"),
+            "popularity": p.get("popularity"),
+        }
+        for p in cands
+    ]
+    return {"ok": True, "mode": "multi", "candidates": candidates}

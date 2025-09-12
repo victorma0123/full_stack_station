@@ -17,6 +17,8 @@ import type { Map as mp } from "leaflet";
 import type { MapContainerProps } from "react-leaflet";
 import type { Layout, Config, Data } from "plotly.js";
 import ReactMarkdown, { type Components } from "react-markdown";
+import "leaflet/dist/leaflet.css";
+
 
 
 
@@ -82,6 +84,7 @@ function useEventBus() {
 
   return api;
 }
+
 
 
 /**
@@ -166,6 +169,25 @@ function ChatBubble({ role, content, meta }: ChatMessage) {
 
 
 function ChatPane({ width = 420, height = 720, fill = false }: { width?: number; height?: number; fill?: boolean }) {
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+  
+    const logAdd = (node: Element) => {
+      if (node.classList?.contains("leaflet-container")) {
+        console.warn("[DOM] leaflet-container added", { node, stack: new Error().stack });
+      }
+    };
+  
+    const mo = new MutationObserver((mutations) => {
+      mutations.forEach(m => {
+        m.addedNodes.forEach(n => n.nodeType === 1 && logAdd(n as Element));
+      });
+    });
+  
+    mo.observe(document.body, { childList: true, subtree: true });
+    return () => mo.disconnect();
+  }, []);
+  
   const bus = useContext(BusCtx);
   const [streamActive, setStreamActive] = useState(false);
   const assistantIndexRef = useRef<number>(-1);
@@ -711,8 +733,8 @@ function ToolPane() {
             </TabsContent>
 
             <TabsContent value="coverage" className="h-full p-4">
-              {coverageReq ? (
-                <CoveragePane request={coverageReq} />
+              {activeTab === "coverage" && coverageReq ? (
+                <CoveragePane key={coverageReq.station_id} request={coverageReq} />
               ) : (
                 <Placeholder title="暂无覆盖图" desc="在详情中点击‘估算覆盖’按钮以查看覆盖范围" />
               )}
@@ -801,6 +823,25 @@ interface MapPaneProps {
 function MapPane({ city, query, onSelectStation }: MapPaneProps) {
   const [stations, setStations] = useState<Station[]>([]);
   const [loading, setLoading] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      setLoading(true);
+      try {
+        const url = `${API_BASE}/api/geo/stations?` + new URLSearchParams({ city }).toString();
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!alive) return;
+        setStations(Array.isArray(data?.stations) ? data.stations : []);
+      } catch (e) {
+        if (!alive) return;
+        console.error("load stations failed:", e);
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, [city, query]);
 
   const fetchStations = async () => {
     setLoading(true);
@@ -1006,45 +1047,32 @@ const TileLayer = dynamic(() => import("react-leaflet").then(m => m.TileLayer), 
 const Marker = dynamic(() => import("react-leaflet").then(m => m.Marker), { ssr: false });
 const Circle = dynamic(() => import("react-leaflet").then(m => m.Circle), { ssr: false });
 const Popup = dynamic(() => import("react-leaflet").then(m => m.Popup), { ssr: false });
+// 替换你当前的 ResizeOnShow 全部实现
+import { useMap } from "react-leaflet";
+
 function ResizeOnShow() {
-  const [map, setMap] = React.useState<mp | null>(null);
-
-
+  const map = useMap(); // ← 关键：从 context 里拿 map
   React.useEffect(() => {
     if (!map) return;
-
     let alive = true;
     const safeInvalidate = () => {
-      // `_mapPane` 是 Leaflet 内部私有属性，类型声明里没有
-      // 所以这里用 @ts-expect-error 注解掉
-      // @ts-expect-error: _mapPane is a private Leaflet field, not in type definitions
+      // @ts-expect-error _mapPane 是私有字段
       if (!alive || !map || !map._mapPane) return;
-    
-      try {
-        map.invalidateSize();
-      } catch {
-        // ignore
-      }
+      try { map.invalidateSize(); } catch {}
     };
-
-    // 优先等待 Leaflet 就绪再触发
-    map.whenReady(() => {
-      // 第一帧
+    map.whenReady?.(() => {
       requestAnimationFrame(safeInvalidate);
-      // 第二帧兜底（有些布局需要两帧）
       requestAnimationFrame(() => requestAnimationFrame(safeInvalidate));
     });
-
-    // 再监听一次 'load'（某些瓦片/样式异步时更稳）
     const onLoad = () => requestAnimationFrame(safeInvalidate);
-    map.on("load", onLoad);
-
+    // @ts-ignore
+    map.on?.("load", onLoad);
     return () => {
       alive = false;
-      map.off("load", onLoad);
+      // @ts-ignore
+      map.off?.("load", onLoad);
     };
   }, [map]);
-
   return null;
 }
 
@@ -1097,71 +1125,104 @@ import iconRetinaUrl from "leaflet/dist/images/marker-icon-2x.png";
 import shadowUrl from "leaflet/dist/images/marker-shadow.png";
 
 // 仅在浏览器端初始化 Leaflet 默认图标
-if (typeof window !== "undefined") {
-  (async () => {
-    const { default: L } = await import("leaflet");
-    // @ts-expect-error: Leaflet 类型里没有 _getIconUrl，但运行时确有该私有属性
-    delete L.Icon.Default.prototype._getIconUrl;
-    L.Icon.Default.mergeOptions({
-      iconRetinaUrl,
-      iconUrl,
-      shadowUrl,
-    });
-  })();
+if (typeof window !== "undefined" && process.env.NODE_ENV === "development") {
+  import("leaflet").then(({ default: L }: any) => {
+    if (!L.__patched) {
+      const Orig = L.Map;
+      L.Map = function PatchedMap(this: any, container: any, options: any) {
+        const el = typeof container === "string" ? document.getElementById(container) : container;
+        if (el && (el as any)._leaflet_id) {
+          console.error("[PATCH] Reusing container!", {
+            existed: (el as any)._leaflet_id,
+            newStack: new Error("init stack").stack,
+            el,
+          });
+        }
+        return new Orig(container, options);
+      };
+      L.Map.prototype = Orig.prototype;
+      L.__patched = true;
+    }
+  });
 }
 
 
 
-// ✅ 安全壳：避免同一容器被重复初始化（StrictMode / Tab 切换 / HMR）
-// ✅ 改造后的 SafeLeaflet
+
+
 type SafeLeafletProps = {
-  id?: string;
+  id: string; // 外层容器 id
   mapRef: React.MutableRefObject<mp | null>;
   children: React.ReactNode;
-} & MapContainerProps;
+} & Omit<MapContainerProps, "id">;
 
-function SafeLeaflet({ id = "leaflet-wrapper", mapRef, children, ...rest }: SafeLeafletProps) {
+function SafeLeaflet({ id, mapRef, children, ...rest }: SafeLeafletProps) {
   const [ready, setReady] = React.useState(false);
   const wrapperRef = React.useRef<HTMLDivElement | null>(null);
-  const [containerKey, setContainerKey] = React.useState(() => `${id}-${Date.now()}`);
+
+  // 内层 leaflet 容器的 id（真正被 Leaflet 绑定的那个 div）
+  const innerId = React.useMemo(() => `${id}__leaflet`, [id]);
+
+  // 强制重建 key
+  const [containerKey, setContainerKey] = React.useState(() => `${innerId}-${Date.now()}`);
 
   React.useLayoutEffect(() => {
-    const el = wrapperRef.current;
-    if (!el) return;
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
 
-    try { if (mapRef?.current) { mapRef.current.remove(); mapRef.current = null; } } catch {}
+    // 1) 把旧 map 实例卸载
+    try { if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } } catch {}
 
-    try {
-      const existed = el.querySelectorAll(".leaflet-container");
-      existed.forEach(node => node.parentNode && node.parentNode.removeChild(node));
-      el.replaceChildren();
-    } catch {}
+    // 2) 若页面上已经有同 innerId 的“旧容器”（HMR/StrictMode 很常见），直接“换壳”
+    //    —— 用 cloneNode(false) 替换自己，保证新节点绝无 _leaflet_id
+    const stale = document.getElementById(innerId) as any;
+    if (stale) {
+      const fresh = stale.cloneNode(false) as HTMLElement;
+      // 保险：清掉任何私有标记
+      try { if ((stale as any)._leaflet_id) delete (stale as any)._leaflet_id; } catch {}
+      stale.parentNode?.replaceChild(fresh, stale);
+    }
 
-    setContainerKey(`${id}-${performance.now()}`);
+    // 3) 清理 wrapper 下面任何历史 .leaflet-container（再保险）
+    wrapper.querySelectorAll(".leaflet-container").forEach((el) => {
+      try { if ((el as any)._leaflet_id) delete (el as any)._leaflet_id; } catch {}
+      el.parentNode?.removeChild(el);
+    });
+
+    // 4) 触发本次渲染
+    setContainerKey(`${innerId}-${performance.now()}`);
     const raf = requestAnimationFrame(() => setReady(true));
     return () => cancelAnimationFrame(raf);
-  }, [id, mapRef]);
+  }, [innerId, mapRef]);
+
+  // 卸载时顺手把内层容器的 _leaflet_id 删掉（再稳一点）
+  React.useEffect(() => {
+    return () => {
+      try {
+        const el = document.getElementById(innerId) as any;
+        if (el && el._leaflet_id) delete el._leaflet_id;
+      } catch {}
+      try { if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } } catch {}
+    };
+  }, [innerId, mapRef]);
 
   return (
-    <div id={id} ref={wrapperRef} style={{ height: "100%", width: "100%" }}>
+    <div id={id} ref={wrapperRef} data-safe-leaflet="1" style={{ height: "100%", width: "100%" }}>
       {ready ? (
         <LeafletMap
-            key={containerKey}
-            ref={(m: mp | null) => {
-              if (!m) return;
-              if (mapRef.current && mapRef.current !== m) {
-                try { mapRef.current.remove(); } catch {}
-              }
-              mapRef.current = m;
-            }}
-            {...rest}
-          >
-            {children}
-          </LeafletMap>
+          id={innerId}                     // ← 把 id 赋给 内层 leaflet 容器
+          key={containerKey}               // ← 每次都用新 key 保证重新挂载
+          ref={(m: mp | null) => { mapRef.current = m; }}
+          {...rest}
+        >
+          {children}
+        </LeafletMap>
       ) : null}
     </div>
   );
 }
+
+
 
 
 
@@ -1174,29 +1235,69 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
   }>(null);
   const [err, setErr] = useState<string | null>(null);
 
+  // Leaflet 实例 & 自身实例 id
   const mapRef = React.useRef<mp | null>(null);
+  const selfIdRef = React.useRef<number | undefined>(undefined);
 
+  // 盒子自适应（你已有的工具）
   const Box = UseResizeInvalidate({ mapRef });
 
   // 仅在客户端渲染
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   const isClient = typeof window !== "undefined";
-
-  // 每次换站点都强制换一个全新的实例 key
-  const [instanceKey, setInstanceKey] = useState(0);
-  useEffect(() => { setInstanceKey(k => k + 1); }, [request?.station_id]);
-
-  // 卸载时彻底销毁旧 Map 实例
+  const [frameReady, setFrameReady] = useState(false);
   useEffect(() => {
-    return () => {
-      if (mapRef.current) {
-        try { mapRef.current.remove(); } catch {}
-        mapRef.current = null;
-      }
-    };
+    const raf = requestAnimationFrame(() => setFrameReady(true));
+    return () => cancelAnimationFrame(raf);
+  }, []);
+  
+
+  // 每次挂载生成一次 nonce，确保每次挂载都是全新 DOM 容器（避免复用）
+  const [mountNonce] = useState(() => String(performance.now()));
+  const containerId = React.useMemo(
+    () => `leaflet-map-coverage-${request?.station_id ?? "unknown"}-${mountNonce}`,
+    [request?.station_id, mountNonce]
+  );
+
+  // 创建时记录自己的 _leaflet_id，后续卸载只移除“自己”的实例
+  const onCreated = useCallback((m: mp) => {
+    mapRef.current = m;
+    // @ts-ignore
+    selfIdRef.current = (m as any)._leaflet_id;
+
+    // 初次就绪后再做一次尺寸校准
+    try {
+      // @ts-ignore
+      m.whenReady?.(() => requestAnimationFrame(() => m.invalidateSize?.()));
+    } catch {}
   }, []);
 
+  // 卸载时清理：仅当容器仍属于“自己”时才 remove，避免与新实例抢容器
+  useEffect(() => {
+    return () => {
+      const m = mapRef.current as any;
+      if (!m) return;
+      const el: any = m.getContainer?.() || m._container;
+  
+      try { m.remove?.(); } catch {}
+      mapRef.current = null;
+  
+      // 🔥 关键：清掉容器上的 _leaflet_id
+      if (el && el._leaflet_id) {
+        delete el._leaflet_id;
+      }
+  
+      try {
+        const node = document.getElementById(containerId) as any;
+        if (node && (!node.querySelector(".leaflet-container"))) {
+          node.replaceChildren();
+          if (node._leaflet_id) delete node._leaflet_id; // 再兜底删一次
+        }
+      } catch {}
+    };
+  }, [containerId]);
+  
   const fetchCoverage = useCallback(async () => {
     setLoading(true); setErr(null);
     try {
@@ -1206,14 +1307,9 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
       if (!json?.ok) throw new Error(json?.error || "coverage api failed");
       setData(json);
     } catch (e: unknown) {
-      if (e instanceof Error) {
-        setErr(e.message);
-      } else {
-        setErr(String(e));
-      }
+      setErr(e instanceof Error ? e.message : String(e));
       setData(null);
-    }
-    finally {
+    } finally {
       setLoading(false);
     }
   }, [request?.station_id]);
@@ -1228,7 +1324,10 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
     </div>
   );
   if (!data?.station) return <div className="border rounded-xl p-4 text-sm">暂无数据或站点信息</div>;
-  if (!isClient || !mounted) return <div className="border rounded-xl p-4 text-sm">地图初始化中…</div>;
+  if (!isClient || !mounted || !frameReady) {
+    return <div className="border rounded-xl p-4 text-sm">地图初始化中…</div>;
+  }
+  
 
   const s = data.station;
   const lat = Number(s?.lat ?? 0);
@@ -1236,9 +1335,7 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
   const radius = Number(data?.radius_m ?? 0);
   const zoom = radius > 0 ? Math.max(12, Math.min(17, Math.floor(15 - Math.log2(radius / 500)))) : 14;
 
-  // 为 MapContainer 指定一个稳定且唯一的 id，便于 SafeLeaflet 做兜底清理
-  const containerId = `leaflet-map-${request?.station_id || "unknown"}-${instanceKey}`;
-
+  
   return (
     <div className="space-y-3">
       <div className="text-sm text-muted-foreground">
@@ -1248,8 +1345,8 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
       <div className="relative" style={{ transform: "none", isolation: "isolate", height: "100%", width: "100%" }}>
         <Box className="h-80 md:h-96 min-h-[320px] w-full rounded-xl overflow-hidden border">
           <SafeLeaflet
-            id={containerId}          // ✅ 让容器可被检测/清理
-            key={containerId}         // ✅ 每次都是真正新的实例
+            id={containerId}          // 唯一容器 id（每次挂载都不同）
+            key={containerId}         // 强制全新实例
             mapRef={mapRef}
             center={[lat, lng]}
             zoom={zoom}
@@ -1257,6 +1354,7 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
             zoomAnimation={false}
             fadeAnimation={false}
             preferCanvas
+            whenCreated={onCreated}   // 记录自己的 _leaflet_id
           >
             <TileLayer
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -1264,10 +1362,9 @@ function CoveragePane({ request }: { request: { station_id: string } }) {
               detectRetina
               eventHandlers={{
                 load: () => {
-                  const m = mapRef.current;
-                  // `_mapPane` 在类型里不存在，但运行时确实有
-                  if (m && "_mapPane" in m) {
-                    requestAnimationFrame(() => m.invalidateSize());
+                  const m = mapRef.current as any;
+                  if (m && (m._mapPane || m.getContainer)) {
+                    requestAnimationFrame(() => { try { m.invalidateSize?.(); } catch {} });
                   }
                 },
               }}
