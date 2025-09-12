@@ -136,33 +136,55 @@ function InlineChartTools({
   title?: string;
   spec: PlotlySpec;
 }) {
-  const [gd, setGd] = React.useState<PlotlyHTMLElement | null>(null); 
+  const [gd, setGd] = React.useState<PlotlyHTMLElement | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [copied, setCopied] = React.useState(false);
 
+  const safeTitle = React.useMemo(() => {
+    const raw = title || "chart";
+    return raw.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 120);
+  }, [title]);
+
+  // ✅ 新增：复制 JSON
   const copyJSON = React.useCallback(async () => {
-    await navigator.clipboard.writeText(JSON.stringify(spec, null, 2));
-  }, [spec]);
-
-  const copyCodeBlock = React.useCallback(async () => {
-    const code = "```plotly\n" + JSON.stringify(spec, null, 2) + "\n```";
-    await navigator.clipboard.writeText(code);
-  }, [spec]);
-
-  const downloadPNG = React.useCallback(async () => {
     try {
-      const Plotly = (window as unknown as { Plotly?: typeof import("plotly.js") }).Plotly;
-      if (!Plotly || !gd) return;
-      const uri = await Plotly.toImage(gd, {
-        format: "png",
-        scale: 2,
-        width: gd.clientWidth,
-        height: gd.clientHeight,
-      });
+      await navigator.clipboard.writeText(JSON.stringify(spec, null, 2));
+      setCopied(true);
+      // 1.5 秒后恢复按钮文本
+      setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      console.error("复制 JSON 失败：", e);
+      alert(`复制失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, [spec]);
+
+  // 已有：下载 PNG
+  const downloadPNG = React.useCallback(async () => {
+    if (!gd) return;
+    const Plotly = (window as unknown as { Plotly?: typeof import("plotly.js") }).Plotly;
+    if (!Plotly) {
+      alert("Plotly 尚未就绪，请稍后重试。");
+      return;
+    }
+    setBusy(true);
+    try {
+      const rect = gd.getBoundingClientRect();
+      const width  = Math.max(320, Math.floor(rect.width));
+      const height = Math.max(240, Math.floor(rect.height));
+      const scale = 2;
+
+      const uri = await Plotly.toImage(gd, { format: "png", scale, width, height });
       const a = document.createElement("a");
       a.href = uri;
-      a.download = `${title || "chart"}.png`;
+      a.download = `${safeTitle}.png`;
       a.click();
-    } catch {}
-  }, [gd, title]);
+    } catch (e) {
+      console.error("导出 PNG 失败：", e);
+      alert(`导出失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [gd, safeTitle]);
 
   return (
     <div className="mt-2 border rounded-xl overflow-hidden">
@@ -172,13 +194,33 @@ function InlineChartTools({
       </div>
       <div className="flex items-center gap-2 p-2 border-t bg-background/60">
         <span className="text-xs text-muted-foreground mr-auto">{title || "图表"}</span>
-        <button className="text-xs underline" onClick={copyJSON}>复制 JSON</button>
-        <button className="text-xs underline" onClick={copyCodeBlock}>复制代码块</button>
-        <button className="text-xs underline" onClick={downloadPNG}>下载 PNG</button>
+
+        {/* ✅ 复制 JSON按钮（带小手、hover/disabled 状态） */}
+        <button
+          type="button"
+          onClick={copyJSON}
+          className="text-xs underline cursor-pointer hover:opacity-80 active:opacity-60 disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={busy}
+          title="复制图表的 Plotly JSON 规范"
+        >
+          {copied ? "已复制" : "复制 JSON"}
+        </button>
+
+        {/* PNG 下载按钮（保留） */}
+        <button
+          type="button"
+          onClick={downloadPNG}
+          className="text-xs underline cursor-pointer hover:opacity-80 active:opacity-60 disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={busy}
+        >
+          {busy ? "导出中…" : "下载 PNG"}
+        </button>
       </div>
     </div>
   );
 }
+
+
 
 function ChatBubble({ role, content, meta }: ChatMessage) {
   const isUser = role === "user";
