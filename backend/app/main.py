@@ -325,8 +325,21 @@ def nearby_stations_by_poi(poi: dict, radius_m: int | None = None, limit: int = 
     return hits[:limit]
 
 
-# --- 轻规则 & Markdown 工具 ---
-# ====== POI 消歧：短期记忆 & 口令解析（Demo 级，单进程有效） ======
+# === 在 LAST_POI_STATE 定义附近，加上 TTL 与工具函数 ===
+FLOW_TTL_S = 90  # 绑定生存期（秒），够用户补一句“选1/半径1公里”之类
+
+def _flow_expired() -> bool:
+    ts = LAST_POI_STATE.get("created_at") or 0.0
+    return (time.time() - ts) > FLOW_TTL_S
+
+def _clear_flow():
+    LAST_POI_STATE.update({
+        "candidates": [],
+        "selected": None,
+        "city_hint": None,
+        "created_at": 0.0,
+    })
+
 LAST_POI_STATE = {
     "candidates": [],     # 上次产生的候选（多选时）
     "selected": None,     # 已选中的 POI（唯一或用户选择）
@@ -844,66 +857,6 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
-def split_think_and_final(text: str) -> tuple[str, str | None]:
-    """从模型输出里分离 think（只返回安全摘要）与最终答案"""
-    if not text:
-        return "", None
-    think = None
-
-    # 常见样式 1: <think>...</think>
-    m = re.search(r"<think>([\s\S]*?)</think>", text, re.IGNORECASE)
-    if m:
-        think = m.group(1)
-
-    # 常见样式 2: ```think ... ```
-    if think is None:
-        m = re.search(r"```(?:thought|think|reasoning)[\s\S]*?\n([\s\S]*?)```", text, re.IGNORECASE)
-        if m: think = m.group(1)
-
-    # 常见样式 3: 显式前缀（中英）
-    if think is None:
-        m = re.search(r"(?:思考[:：]|推理[:：]|Thought(?:s)?[:：]|Reasoning[:：])([\s\S]{10,}?)(?:\n{1,2}(?:答案|最终答案|Answer|Final)[:：])", text, re.IGNORECASE)
-        if m: think = m.group(1)
-
-    # 去掉 think 块，得到纯正文
-    cleaned = text
-    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"```(?:thought|think|reasoning)[\s\S]*?```", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"(?:思考[:：]|推理[:：]|Thought(?:s)?[:：]|Reasoning[:：])[\s\S]{10,}?(?=\n{1,2}(?:答案|最终答案|Answer|Final)[:：])", "", cleaned, flags=re.IGNORECASE)
-
-    # 压缩空行
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-
-    # 仅发送安全摘要（截断）
-    if think:
-        t = " ".join(think.split())
-        think = (t[:240] + "…") if len(t) > 240 else t
-
-    return cleaned, think
-
-
-def chunk_text(text: str) -> List[str]:
-    """把长文本切成小片段用于伪流式：按句号/换行/逗号分割，再限制长度。"""
-    if not text:
-        return []
-    # 先按句读切
-    parts = re.split(r'(?<=[。！？!?])|\n+', text)
-    # 再做合并，保证每段不太短
-    buf, out = "", []
-    for p in parts:
-        p = (p or "").strip()
-        if not p:
-            continue
-        if len(buf) + len(p) < 60:
-            buf += p
-        else:
-            if buf:
-                out.append(buf)
-            buf = p
-    if buf:
-        out.append(buf)
-    return out
-
 async def sse(gen: AsyncGenerator[Dict[str, Any], None]):
     async for ev in gen:
         yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
@@ -976,54 +929,9 @@ async def chat_sse(payload: str = Query(...)):
     )
 
 
-# 放到文件上方任意位置
-def summarize_or_redact(text: str, limit: int = 240) -> str:
-    """极简脱敏/截断：避免把完整 chain-of-thought 直出，只给摘要。"""
-    if not text:
-        return "（无可展示的思考摘要）"
-    t = text.replace("\n", " ").strip()
-    return (t[:limit] + "…") if len(t) > limit else t
 
-def extract_safe_think_from_agent(agent) -> str:
-    """示例：从 agent.messages 里尝试提取 think 字段/元数据，再做摘要。"""
-    msgs = getattr(agent, "messages", []) or []
-    for m in reversed(msgs):
-        # 下面几种键名按你实际的 strands 结构调整
-        meta = (m.get("metadata") or {}) if isinstance(m, dict) else {}
-        raw = (
-            meta.get("think")
-            or m.get("think") if isinstance(m, dict) else None
-        )
-        if raw:
-            return summarize_or_redact(str(raw))
-    return "（无可展示的思考摘要）"
 
-# ======= 新增：把隐藏上下文喂给 agent 的两个助手函数 =======
 
-# ===== helper: 仅提出澄清问题（不泄露隐藏上下文） =====
-async def agent_ask_clarify(hidden_context: str, user_prompt: str):
-    sys_guard = (
-        "系统指令：你将收到一段【隐藏上下文 HIDDEN_CONTEXT】（包含若干候选地点）。"
-
-        "你的任务是提出一个简短澄清问题，帮助用户进一步限定精确地点或范围。"
-        "严禁泄露、引用或转述隐藏上下文里的任何细节（名称/数量/ID/地址/坐标/字段值）。"
-        "语气直接；1 句中文，≤25字；不客套、不列举、不给选项。"
-        "优先追问城市/区县/地标/半径等可操作信息。"
-        "这一段结束后忘记记忆不要再提交"
-    )
-    prompt = (
-        f"{sys_guard}\n\n"
-        f"HIDDEN_CONTEXT:\n<<<\n{hidden_context}\n>>>\n\n"
-        f"用户原话：{user_prompt}\n"
-        "只输出问题："
-    )
-    async for delta in stream_from_ollama(prompt):
-        yield {"type": "token", "delta": delta}
-    yield {"type": "end"}
-
-# ===== helper: 基于可见上下文作答（允许说明“具体哪里有”） =====
-# ===== 统一的 agent 出口：multiple=True => 只反问；multiple=False => 直接作答 =====
-# ===== 统一的 agent 出口：multiple=True => 列出地区/街道选项并发问 =====
 async def agent_answer_with_context(context_text: str, user_prompt: str, *, multiple: bool = False):
     """
     context_text: 传入 JSON 字符串（候选/选定POI/统计/代表点位等）
@@ -1090,15 +998,21 @@ def is_pure_city_query(text: str) -> bool:
     return bool(PURE_CITY_RE.search(p))
 
 
-# ✅ 直接替换 app/main.py 里的 handle_nearby_flow_gen 即可
 async def handle_nearby_flow_gen(prompt: str):
     import time as _time
     p = (prompt or "").strip()
     if not p:
         return
 
+    # 过期即清
+    if _flow_expired():
+        _clear_flow()
+
+    # 是否出现“附近/周边/基站/5G/4G”等意图词
+    has_near_word = bool(NEAR_WORDS_RE.search(p) or BS_WORDS_RE)
+
     poi_key       = extract_poi_key(p) or ""      # 只有抓到具体 POI 名才算
-    has_near_word = bool(NEAR_WORDS_RE.search(p)) # “附近/周边/周围/邻近/最近/…” 等
+    #has_near_word = bool(NEAR_WORDS_RE.search(p)) # “附近/周边/周围/邻近/最近/…” 等
     in_flow       = bool(LAST_POI_STATE.get("candidates") or LAST_POI_STATE.get("selected"))
 
     # 🚫 纯“城市 + 基站” → 不拦截，交给后续城市/兜底逻辑
@@ -1150,6 +1064,8 @@ async def handle_nearby_flow_gen(prompt: str):
             visible_ctx = json.dumps(ctx, ensure_ascii=False)
             async for ev in agent_answer_with_context(visible_ctx, p, multiple=False):
                 yield ev
+            LAST_POI_STATE["selected"] = None
+            LAST_POI_STATE["created_at"] = time.time()
             return
         else:
             # 仍不唯一 → 继续请 agent 追问（不回显清单）
@@ -1197,6 +1113,8 @@ async def handle_nearby_flow_gen(prompt: str):
         visible_ctx = json.dumps(ctx, ensure_ascii=False)
         async for ev in agent_answer_with_context(visible_ctx, p, multiple=False):
             yield ev
+        LAST_POI_STATE["selected"] = None
+        LAST_POI_STATE["created_at"] = time.time()
         return
 
     # 多个候选：进入“待选”状态，但不回显；让 agent 只提出一个澄清问题
