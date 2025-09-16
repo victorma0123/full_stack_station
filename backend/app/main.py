@@ -13,7 +13,6 @@ from typing import Optional
 import anyio
 import base64
 import httpx
-import asyncio
 from collections import Counter
 from .mock_geo import BASE as POI_SEED
 from . import pois_json
@@ -353,7 +352,6 @@ CHOICE_ID_RE     = re.compile(r"\bPOI-[A-Z]{2}-\d{4}\b", re.I)
 CITY_HINT_RE     = re.compile(r"(北京|上海|广州|深圳|杭州)")
 DISTRICT_HINT_RE = re.compile(r"(朝阳|海淀|东城|西城|石景山|黄浦|浦东|闵行|越秀|番禺|龙华|龙岗|滨江)")
 RADIUS_RE        = re.compile(r"(?:(?:半径|范围|圈|距离|附近|周边).{0,4})?(\d+(?:\.\d+)?)\s*(米|m|公里|千米|km)", re.I)
-TOPK_RE          = re.compile(r"(?:最近|前|取)\s*(\d{1,2})\s*(?:个|站)?")
 
 def _cn_to_int(tok: str) -> int | None:
     tok = tok.strip()
@@ -381,11 +379,7 @@ def parse_radius_m(text: str) -> int | None:
     if unit in ("公里","千米","km"): return int(val*1000)
     return None
 
-def parse_topk(text: str) -> int | None:
-    m = TOPK_RE.search(text or ""); 
-    if not m: return None
-    try: return int(m.group(1))
-    except: return None
+
 
 def filter_candidates_by_hint(cands: list[dict], text: str) -> list[dict]:
     if not cands: return []
@@ -542,41 +536,6 @@ def render_city_status_report(city: str, status: str, rows: list[dict]) -> str:
     ]
     return "\n\n".join(["\n".join(p1), "\n".join(p2), "\n".join(p3), "\n".join(p4)])
 
-def city_table_markdown(city: str, rows: list[dict]) -> str:
-    """把某个城市的基站列表转成 Markdown 报告格式"""
-
-    total = len(rows)
-    if not rows:
-        return f"# {city} 基站清单\n\n⚠️ 没有找到相关基站。\n"
-
-    # 概览部分
-    parts = [
-        f"# {city} 基站清单\n",
-        f"**城市**：{city}  \n**基站总数**：**{total}**\n",
-        "---\n",  # 分隔线
-        "## 数据明细\n",
-    ]
-
-    # 表格标题
-    header = ["ID", "名称", "厂商", "频段", "状态"]
-    lines = ["| " + " | ".join(header) + " |"]
-    lines.append("|" + "|".join(["---"] * len(header)) + "|")
-
-    # 内容行
-    for r in rows:
-        line = "| " + " | ".join([
-            str(r.get("id", "—")),
-            str(r.get("name", "—")),
-            str(r.get("vendor", "—")),
-            str(r.get("band", "—")),
-            f"**{r.get('status', '—')}**",   # 状态加粗
-        ]) + " |"
-        lines.append(line)
-
-    parts.append("\n".join(lines))
-    parts.append("\n---\n")  # 结尾分隔线
-
-    return "\n".join(parts)
 
 
 def topk_context_for_prompt(prompt: str, k: int = 12) -> list[dict]:
@@ -1325,13 +1284,11 @@ async def agent_stream(messages: List[Dict[str, str]], context: Dict[str, Any] |
         aug_prompt = ("【可用基站候选（仅供参考）】\n" + ctx_md + "\n\n" + aug_prompt)
         yield {"type": "log", "channel": "router", "message": f"提供 TopK={len(topk)} 行上下文给模型"}
 
-    # === 真流式：直连 Ollama ===
     buf = []
     async for delta in stream_from_ollama(aug_prompt):
         buf.append(delta)
         yield {"type": "token", "delta": delta}
 
-    # （可选）在此对 ''.join(buf) 做 split_think_and_final/后验校验
     yield {"type": "end"}
 
 
